@@ -1,0 +1,36 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Builds / artifacts
+dist/
+target/
+**/target/
+apps/desktop/dist/
+*.log
+*.tsbuildinfo
+pnpm-debug.log*
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Local data / secrets
+.env
+.env.*
+!.env.example
+
+# Tauri generated (regenerated locally / in CI as needed)
+apps/desktop/src-tauri/gen/
+apps/desktop/src-tauri/WixTools/
+
+# Local app data dir (running from repo)
+.screenrecall/
+
+# Planning / working notes (not versioned)
+docs/PLAN.md
+docs/planning/

@@ -1,0 +1,79 @@
+[package]
+name = "screenrecall"
+version = "0.1.0"
+description = "Private, local-first screen recall (ScreenRecall)"
+authors = ["ScreenRecall contributors"]
+edition = "2021"
+rust-version = "1.77"
+
+# Binary + lib so Tauri's mobile CI can share code. Desktop uses the bin.
+[lib]
+name = "screenrecall_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "screenrecall"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["protocol-asset", "tray-icon", "image-png"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
+tauri-plugin-notification = "2"
+tauri-plugin-opener = "2"
+
+# Async + logging
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Serialization + errors
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "1"
+
+# Time & ids
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+
+# Screen capture + images
+xcap = "0.9"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+
+# HTTP (Ollama / OpenAI)
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+futures-util = "0.3"
+bytes = "1"
+async-trait = "0.1"
+
+# Storage
+rusqlite = { version = "0.32", features = ["bundled", "blob", "chrono"] }
+
+# Active window detection
+active-win-pos-rs = "0.9"
+
+# Directories
+directories = "5"
+
+# OCR (Tesseract CLI wrapper)
+rusty-tesseract = "1.1"
+
+# Byteorder for embedding blob encoding
+byteorder = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_System_LibraryLoader",
+  "Win32_System_RemoteDesktop",
+  "Win32_UI_WindowsAndMessaging",
+] }
+
+[features]
+default = ["custom-protocol"]
+# Tauri uses the custom protocol in release to load the UI
+custom-protocol = ["tauri/custom-protocol"]

@@ -1,0 +1,12 @@
+{
+  "name": "screenrecall",
+  "version": "0.1.0",
+  "private": true,
+  "description": "ScreenRecall — private, local-first screen recall (Tauri + React + Rust)",
+  "packageManager": "pnpm@9.0.0",
+  "scripts": {
+    "dev": "pnpm --filter desktop tauri dev",
+    "build": "pnpm --filter desktop tauri build",
+    "fmt": "pnpm --filter desktop format"
+  }
+}

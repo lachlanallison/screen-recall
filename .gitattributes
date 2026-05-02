@@ -1,0 +1,2 @@
+# Let Git normalize line endings; keeps cross-platform repos predictable.
+* text=auto
