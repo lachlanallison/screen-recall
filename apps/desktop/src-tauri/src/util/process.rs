@@ -18,3 +18,9 @@ pub fn configure_hidden_tokio(cmd: &mut tokio::process::Command) {
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
 }
+
+pub fn hidden_command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+    let mut cmd = std::process::Command::new(program);
+    configure_hidden_std(&mut cmd);
+    cmd
+}

@@ -1,10 +1,13 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { format } from "date-fns";
-import { Expand, ExternalLink, Search as SearchIcon, Sparkles, X } from "lucide-react";
+import { ExternalLink, Search as SearchIcon, Sparkles } from "lucide-react";
 import { api, type SearchHit } from "../lib/api";
 import { cn } from "../lib/cn";
 import { openFrameWindow } from "../lib/frameWindow";
 import { staticHeldLabel } from "../lib/staticHeld";
+import { FrameViewer } from "../lib/components/ImageViewer";
+import { ContextMenu } from "../lib/components/ContextMenu";
+import { useEscape } from "../lib/components/useEscape";
 
 export default function SearchView() {
   const [query, setQuery] = useState("");
@@ -13,7 +16,6 @@ export default function SearchView() {
   const [hits, setHits] = useState<SearchHit[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [viewer, setViewer] = useState<SearchHit | null>(null);
-  const [viewerFullscreen, setViewerFullscreen] = useState(false);
   const [menu, setMenu] = useState<{
     x: number;
     y: number;
@@ -34,21 +36,13 @@ export default function SearchView() {
     }
   };
 
+  const closeMenu = useCallback(() => setMenu(null), []);
+  useEscape(() => { setViewer(null); setMenu(null); });
+
   useEffect(() => {
-    const closeMenu = () => setMenu(null);
-    const closeViewer = (evt: KeyboardEvent) => {
-      if (evt.key === "Escape") {
-        setViewer(null);
-        setViewerFullscreen(false);
-      }
-    };
     window.addEventListener("click", closeMenu);
-    window.addEventListener("keydown", closeViewer);
-    return () => {
-      window.removeEventListener("click", closeMenu);
-      window.removeEventListener("keydown", closeViewer);
-    };
-  }, []);
+    return () => window.removeEventListener("click", closeMenu);
+  }, [closeMenu]);
 
   return (
     <div className="flex h-full flex-col">
@@ -107,8 +101,8 @@ export default function SearchView() {
       <div className="flex-1 overflow-y-auto scrollbar-thin p-4">
         {hits.length === 0 && !loading && (
           <div className="flex h-full items-center justify-center text-sm text-text-muted">
-            Try: “error message yesterday”, “github pull request”, or
-            “invoice template”.
+            Try: "error message yesterday", "github pull request", or
+            "invoice template".
           </div>
         )}
         <div className="grid grid-cols-[repeat(auto-fill,minmax(260px,1fr))] gap-3">
@@ -159,84 +153,29 @@ export default function SearchView() {
       </div>
 
       {viewer && (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4"
-          onClick={() => {
-            setViewer(null);
-            setViewerFullscreen(false);
+        <FrameViewer
+          frame={viewer.frame}
+          onClose={() => setViewer(null)}
+          onContextMenu={(e) => {
+            e.preventDefault();
+            setMenu({ x: e.clientX, y: e.clientY, hit: viewer });
           }}
-        >
-          <div
-            className={
-              "relative overflow-hidden rounded-lg border border-border bg-bg-elevated " +
-              (viewerFullscreen ? "h-[95vh] w-[95vw]" : "h-[80vh] w-[80vw] max-w-6xl")
-            }
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="flex items-center gap-2 border-b border-border px-3 py-2 text-xs text-text-muted">
-              <span className="truncate">
-                {viewer.frame.window_title ?? viewer.frame.app ?? viewer.frame.path}
-              </span>
-              <button
-                type="button"
-                onClick={() => setViewerFullscreen((v) => !v)}
-                className="ml-auto rounded border border-border p-1 hover:bg-bg-hover"
-                title={viewerFullscreen ? "Exit fullscreen" : "Fullscreen"}
-              >
-                <Expand className="h-3.5 w-3.5" />
-              </button>
-              <button
-                type="button"
-                onClick={() => openFrameWindow(viewer.frame)}
-                className="rounded border border-border p-1 hover:bg-bg-hover"
-                title="Open in new window"
-              >
-                <ExternalLink className="h-3.5 w-3.5" />
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setViewer(null);
-                  setViewerFullscreen(false);
-                }}
-                className="rounded border border-border p-1 hover:bg-bg-hover"
-                title="Close"
-              >
-                <X className="h-3.5 w-3.5" />
-              </button>
-            </div>
-            <div className="h-[calc(100%-2.25rem)] w-full bg-black">
-              <img
-                src={api.assetUrl(viewer.frame.path)}
-                alt={viewer.frame.window_title ?? viewer.frame.app ?? "Captured frame"}
-                className="h-full w-full object-contain"
-                onContextMenu={(e) => {
-                  e.preventDefault();
-                  setMenu({ x: e.clientX, y: e.clientY, hit: viewer });
-                }}
-              />
-            </div>
-          </div>
-        </div>
+        />
       )}
 
       {menu && (
-        <div
-          className="fixed z-[60] min-w-44 rounded-md border border-border bg-bg-elevated p-1 shadow-lg"
-          style={{ left: menu.x, top: menu.y }}
-        >
-          <button
-            type="button"
-            onClick={() => {
-              openFrameWindow(menu.hit.frame);
-              setMenu(null);
-            }}
-            className="flex w-full items-center gap-2 rounded px-2 py-1 text-xs hover:bg-bg-hover"
-          >
-            <ExternalLink className="h-3.5 w-3.5" />
-            Open in new window
-          </button>
-        </div>
+        <ContextMenu
+          x={menu.x}
+          y={menu.y}
+          onClose={closeMenu}
+          items={[
+            {
+              label: "Open in new window",
+              icon: <ExternalLink className="h-3.5 w-3.5" />,
+              onClick: () => openFrameWindow(menu.hit.frame),
+            },
+          ]}
+        />
       )}
     </div>
   );

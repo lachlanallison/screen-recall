@@ -1,7 +1,10 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { format } from "date-fns";
-import { Copy, Expand, ExternalLink, FolderOpen, X, Film, Image as ImageIcon } from "lucide-react";
+import { Copy, Expand, ExternalLink, FolderOpen, Film, Image as ImageIcon } from "lucide-react";
 import { api, type EmbeddingPreview, type Frame } from "../lib/api";
+import { FrameViewer } from "../lib/components/ImageViewer";
+import { ContextMenu } from "../lib/components/ContextMenu";
+import { useEscape } from "../lib/components/useEscape";
 import { openFrameWindow } from "../lib/frameWindow";
 import { staticHeldLabel } from "../lib/staticHeld";
 
@@ -41,7 +44,6 @@ export default function Timeline() {
   const [hasMore, setHasMore] = useState(true);
   const [refreshSecs, setRefreshSecs] = useState(5);
   const [viewer, setViewer] = useState<Frame | null>(null);
-  const [viewerFullscreen, setViewerFullscreen] = useState(false);
   const [menu, setMenu] = useState<{
     x: number;
     y: number;
@@ -55,6 +57,7 @@ export default function Timeline() {
   const [embedFilter, setEmbedFilter] = useState<
     "any" | "vector" | "na" | "pending"
   >("any");
+  const [viewMode, setViewMode] = useState<"latest" | "archived">("latest");
 
   // State for video frame extraction
   const [frozenFrameUrl, setFrozenFrameUrl] = useState<string | null>(null);
@@ -63,12 +66,11 @@ export default function Timeline() {
   const refreshFrames = useCallback(async () => {
     try {
       const result = await api.listFrames({ limit: PAGE_SIZE });
-      setFrames(result);
-      setHasMore(result.length >= PAGE_SIZE);
-      setSelected((prev) => {
-        if (!prev) return result[0] ?? null;
-        const still = result.find((f) => f.id === prev.id);
-        return still ?? result[0] ?? null;
+      setFrames((prev) => {
+        const seen = new Set(prev.map((f) => f.id));
+        const add = result.filter((f) => !seen.has(f.id));
+        if (add.length === 0) return prev;
+        return [...add, ...prev];
       });
     } catch {
       /* ignore */
@@ -76,6 +78,25 @@ export default function Timeline() {
       setLoading(false);
     }
   }, []);
+
+  // Separate filtered views derived from the same frames array — instant switching.
+  const latestFrames = useMemo(
+    () => frames.filter((f) => matchDebugFilters(f, ocrFilter, embedFilter) && !f.video_path),
+    [frames, ocrFilter, embedFilter],
+  );
+  const archivedFrames = useMemo(
+    () => frames.filter((f) => f.video_path),
+    [frames],
+  );
+  const displayFrames = viewMode === "archived" ? archivedFrames : latestFrames;
+
+  useEffect(() => {
+    setSelected((prev) => {
+      if (!prev) return latestFrames[0] ?? null;
+      if (latestFrames.some((f) => f.id === prev.id)) return prev;
+      return latestFrames[0] ?? null;
+    });
+  }, [latestFrames]);
 
   const loadOlder = useCallback(async () => {
     if (loadingMore || !hasMore || frames.length === 0) return;
@@ -123,35 +144,21 @@ export default function Timeline() {
     return () => clearInterval(id);
   }, [refreshSecs, refreshFrames]);
 
+  const closeMenu = useCallback(() => setMenu(null), []);
+  useEscape(() => { setViewer(null); setMenu(null); });
+
   useEffect(() => {
-    const closeMenu = () => setMenu(null);
     window.addEventListener("click", closeMenu);
     return () => window.removeEventListener("click", closeMenu);
-  }, []);
-
-  useEffect(() => {
-    const onKey = (evt: KeyboardEvent) => {
-      if (evt.key === "Escape") {
-        setViewer(null);
-        setViewerFullscreen(false);
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, []);
-
-  const filteredFrames = useMemo(
-    () => frames.filter((f) => matchDebugFilters(f, ocrFilter, embedFilter)),
-    [frames, ocrFilter, embedFilter],
-  );
+  }, [closeMenu]);
 
   useEffect(() => {
     setSelected((prev) => {
-      if (!prev) return filteredFrames[0] ?? null;
-      if (filteredFrames.some((f) => f.id === prev.id)) return prev;
-      return filteredFrames[0] ?? null;
+      if (!prev) return latestFrames[0] ?? null;
+      if (latestFrames.some((f) => f.id === prev.id)) return prev;
+      return latestFrames[0] ?? null;
     });
-  }, [filteredFrames]);
+  }, [latestFrames]);
 
   useEffect(() => {
     if (!selected) {
@@ -252,7 +259,7 @@ export default function Timeline() {
       // Find closest frame
       const currentMs = video.currentTime * 1000;
       if (displayFrame.video_path) {
-        const segmentFrames = filteredFrames.filter(
+        const segmentFrames = frames.filter(
           (f) => f.video_path === displayFrame.video_path
         );
         let closest = segmentFrames[0];
@@ -297,15 +304,38 @@ export default function Timeline() {
   return (
     <div className="flex h-full flex-col">
       <header className="flex flex-col gap-2 border-b border-border px-4 py-2">
-        <div className="flex min-h-8 items-center">
-          <h1 className="text-sm font-medium">Timeline</h1>
-          <span className="ml-auto text-xs text-text-faint">
-            {filteredFrames.length} shown
-            {frames.length !== filteredFrames.length
-              ? ` of ${frames.length}`
-              : ""}
-            {refreshSecs > 0 ? ` · refresh ${refreshSecs}s` : " · manual refresh"}
-          </span>
+        <div className="flex min-h-8 items-center gap-3">
+          <div className="flex items-center gap-1 rounded-md border border-border bg-bg p-0.5">
+            <button
+              type="button"
+              onClick={() => setViewMode("latest")}
+              className={"rounded px-2.5 py-1 text-xs font-medium transition-colors " + (viewMode === "latest" ? "bg-accent text-black" : "text-text-muted hover:text-text")}
+            >
+              Latest
+            </button>
+            <button
+              type="button"
+              onClick={() => setViewMode("archived")}
+              className={"rounded px-2.5 py-1 text-xs font-medium transition-colors " + (viewMode === "archived" ? "bg-accent text-black" : "text-text-muted hover:text-text")}
+            >
+              Archived
+            </button>
+          </div>
+          {viewMode === "latest" && (
+            <span className="ml-auto text-xs text-text-faint">
+              {latestFrames.length} shown
+              {frames.length !== latestFrames.length
+                ? ` of ${frames.length}`
+                : ""}
+              {refreshSecs > 0 ? ` · refresh ${refreshSecs}s` : " · manual refresh"}
+            </span>
+          )}
+          {viewMode === "archived" && (
+            <span className="ml-auto text-xs text-text-faint">
+              {archivedFrames.length} archived
+              {refreshSecs > 0 ? ` · refresh ${refreshSecs}s` : ""}
+            </span>
+          )}
         </div>
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[10px] text-text-faint">
           <span className="text-text-muted">Debug</span>
@@ -351,12 +381,52 @@ export default function Timeline() {
         <Empty message="Loading..." />
       ) : frames.length === 0 ? (
         <Empty message="Nothing captured yet. ScreenRecall will start indexing in the background." />
-      ) : filteredFrames.length === 0 ? (
-        <Empty message="No frames match the debug filters. Clear OCR / Embed filters to see all." />
+      ) : displayFrames.length === 0 ? (
+        <Empty message={viewMode === "archived" ? "No archived videos yet. They appear after the archiver runs." : "No frames match the debug filters."} />
+      ) : viewMode === "archived" ? (
+        <div className="flex-1 overflow-y-auto scrollbar-thin p-4 space-y-6">
+          {Object.entries(groupByDay(archivedFrames)).map(([day, dayFrames]) => {
+            const dayItems = buildTimelineItems(dayFrames);
+            const segmentCards = dayItems.filter((i) => i.type === "video");
+            if (segmentCards.length === 0) return null;
+            return (
+            <section key={day} className="space-y-2">
+              <h2 className="text-xs font-semibold uppercase tracking-wider text-text-muted">{day}</h2>
+              <div className="grid grid-cols-[repeat(auto-fill,minmax(260px,1fr))] gap-3">
+                {segmentCards.map((item) => (
+                  <button
+                    key={item.videoPath}
+                    type="button"
+                    onClick={() => setViewer(item.frames[0])}
+                    onContextMenu={(e) => {
+                      e.preventDefault();
+                      setMenu({ x: e.clientX, y: e.clientY, frame: item.frames[0] });
+                    }}
+                    className={"group overflow-hidden rounded-lg border bg-bg-elevated text-left transition-all text-text-muted hover:border-border-strong" + (selected?.id === item.frames[0]?.id ? " border-accent ring-1 ring-accent" : " border-border")}
+                  >
+                    <div className="aspect-video bg-black/40 overflow-hidden">
+                      <video src={api.assetUrl(item.videoPath)} className="h-full w-full object-cover" preload="metadata" muted />
+                    </div>
+                    <div className="p-3">
+                      <div className="flex items-center gap-1.5 text-xs">
+                        <Film className="h-3 w-3 text-blue-400 shrink-0" />
+                        <span className="truncate">{item.frames[0]?.window_title ?? item.frames[0]?.app ?? "—"}</span>
+                      </div>
+                      <div className="mt-1 text-[10px] text-text-faint">
+                        {item.frames.length} frames · {Math.round(((item.frames[item.frames.length - 1]?.ts ?? 0) - (item.frames[0]?.ts ?? 0)) / 1000)}s
+                      </div>
+                    </div>
+                  </button>
+                ))}
+              </div>
+            </section>
+            );
+          })}
+        </div>
       ) : (
         <div className="flex flex-1 overflow-hidden">
           <div className="flex-1 overflow-y-auto scrollbar-thin p-4 space-y-6">
-            {Object.entries(groupByDay(filteredFrames)).map(([day, dayFrames]) => {
+            {Object.entries(groupByDay(latestFrames)).map(([day, dayFrames]) => {
               const dayItems = buildTimelineItems(dayFrames);
               return (
               <section key={day} className="space-y-2">
@@ -508,7 +578,7 @@ export default function Timeline() {
                     {selectedHeld && (
                       <div className="mt-0.5 text-xs text-text-muted">
                         {selectedHeld} (end{" "}
-                        {format(displayFrame.static_until_ms ?? displayFrame.ts, "PPpp")})
+                        {format(displayFrame.static_until_ms, "PPpp")})
                       </div>
                     )}
                   </div>
@@ -646,128 +716,35 @@ export default function Timeline() {
       )}
 
       {viewer && (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4"
-          onClick={() => {
-            setViewer(null);
-            setViewerFullscreen(false);
+        <FrameViewer
+          frame={viewer}
+          onClose={() => setViewer(null)}
+          showIdBadge
+          showFolderOpen
+          onContextMenu={(e) => {
+            e.preventDefault();
+            setMenu({ x: e.clientX, y: e.clientY, frame: viewer });
           }}
-        >
-          <div
-            className={
-              "relative overflow-hidden rounded-lg border border-border bg-bg-elevated " +
-              (viewerFullscreen ? "h-[95vh] w-[95vw]" : "h-[80vh] w-[80vw] max-w-6xl")
-            }
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="flex items-center gap-2 border-b border-border px-3 py-2 text-xs text-text-muted">
-              <span className="shrink-0 font-mono">#{viewer.id}</span>
-              <span className="truncate">{viewer.window_title ?? viewer.app ?? viewer.path}</span>
-              {viewer.video_path && (
-                <span className="ml-1 inline-flex items-center gap-1 rounded bg-blue-500/10 px-1.5 py-0.5 text-[10px] text-blue-300">
-                  <Film className="h-3 w-3" /> video
-                </span>
-              )}
-              <button
-                type="button"
-                onClick={() => setViewerFullscreen((v) => !v)}
-                className="ml-auto rounded border border-border p-1 hover:bg-bg-hover"
-                title={viewerFullscreen ? "Exit fullscreen" : "Fullscreen"}
-              >
-                <Expand className="h-3.5 w-3.5" />
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  void api.revealFrameInFolder(viewer.video_path ?? viewer.path).catch(() => {});
-                }}
-                className="rounded border border-border p-1 hover:bg-bg-hover"
-                title="Open file location"
-              >
-                <FolderOpen className="h-3.5 w-3.5" />
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  openFrameWindow(viewer);
-                }}
-                className="rounded border border-border p-1 hover:bg-bg-hover"
-                title="Open in new window"
-              >
-                <ExternalLink className="h-3.5 w-3.5" />
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setViewer(null);
-                  setViewerFullscreen(false);
-                }}
-                className="rounded border border-border p-1 hover:bg-bg-hover"
-                title="Close"
-              >
-                <X className="h-3.5 w-3.5" />
-              </button>
-            </div>
-            <div className="h-[calc(100%-2.25rem)] w-full bg-black">
-              {viewer.video_path ? (
-                <video
-                  src={api.assetUrl(viewer.video_path)}
-                  className="h-full w-full object-contain"
-                  controls
-                  autoPlay
-                  onLoadedMetadata={(e) => {
-                    const video = e.currentTarget;
-                    if (viewer.video_offset_ms) {
-                      video.currentTime = viewer.video_offset_ms / 1000;
-                    }
-                  }}
-                />
-              ) : (
-                <img
-                  src={api.assetUrl(viewer.path)}
-                  alt={viewer.window_title ?? viewer.app ?? "Captured frame"}
-                  decoding="async"
-                  className="h-full w-full object-contain"
-                  onContextMenu={(e) => {
-                    e.preventDefault();
-                    setMenu({ x: e.clientX, y: e.clientY, frame: viewer });
-                  }}
-                />
-              )}
-            </div>
-          </div>
-        </div>
+        />
       )}
       {menu && (
-        <div
-          className="fixed z-[60] min-w-44 rounded-md border border-border bg-bg-elevated p-1 shadow-lg"
-          style={{ left: menu.x, top: menu.y }}
-          onClick={(e) => e.stopPropagation()}
-          role="menu"
-        >
-          <button
-            type="button"
-            onClick={() => {
-              openFrameWindow(menu.frame);
-              setMenu(null);
-            }}
-            className="flex w-full items-center gap-2 rounded px-2 py-1 text-xs hover:bg-bg-hover"
-          >
-            <ExternalLink className="h-3.5 w-3.5" />
-            Open in new window
-          </button>
-          <button
-            type="button"
-            onClick={() => {
-              void api.revealFrameInFolder(menu.frame.path).catch(() => {});
-              setMenu(null);
-            }}
-            className="flex w-full items-center gap-2 rounded px-2 py-1 text-xs hover:bg-bg-hover"
-          >
-            <FolderOpen className="h-3.5 w-3.5" />
-            Open file location
-          </button>
-        </div>
+        <ContextMenu
+          x={menu.x}
+          y={menu.y}
+          onClose={closeMenu}
+          items={[
+            {
+              label: "Open in new window",
+              icon: <ExternalLink className="h-3.5 w-3.5" />,
+              onClick: () => openFrameWindow(menu.frame),
+            },
+            {
+              label: "Open file location",
+              icon: <FolderOpen className="h-3.5 w-3.5" />,
+              onClick: () => void api.revealFrameInFolder(menu.frame.path).catch(() => {}),
+            },
+          ]}
+        />
       )}
     </div>
   );
@@ -784,10 +761,10 @@ function VideoSegmentCard({
   onSelect: (f: Frame) => void;
   onContextMenu: (e: React.MouseEvent, f: Frame) => void;
 }) {
-  const first = item.frames[0];
-  const last = item.frames[item.frames.length - 1];
+  const newest = item.frames[0];
+  const earliest = item.frames[item.frames.length - 1];
   const isSelected = item.frames.some((f) => f.id === selected?.id);
-  const durationSec = Math.round((last.ts - first.ts) / 1000);
+  const durationSec = Math.round((newest.ts - earliest.ts) / 1000);
   return (
     <div
       className={
@@ -803,23 +780,23 @@ function VideoSegmentCard({
           muted
           onLoadedMetadata={(e) => {
             const video = e.currentTarget;
-            if (first.video_offset_ms) {
-              video.currentTime = first.video_offset_ms / 1000;
+            if (earliest.video_offset_ms) {
+              video.currentTime = earliest.video_offset_ms / 1000;
             }
           }}
-          onClick={() => onSelect(first)}
-          onContextMenu={(e) => onContextMenu(e, first)}
+          onClick={() => onSelect(earliest)}
+          onContextMenu={(e) => onContextMenu(e, earliest)}
         />
       </div>
       <div className="px-3 py-2">
         <div className="flex items-center gap-1.5">
           <Film className="h-3 w-3 text-blue-400" />
           <span className="truncate text-xs text-text">
-            {first.window_title ?? first.app ?? "—"}
+            {earliest.window_title ?? earliest.app ?? "—"}
           </span>
         </div>
         <div className="text-[10px] text-text-faint">
-          {format(first.ts, "HH:mm:ss")} – {format(last.ts, "HH:mm:ss")}
+          {format(earliest.ts, "HH:mm:ss")} – {format(newest.ts, "HH:mm:ss")}
           {" · "}
           {item.frames.length} frames
           {" · "}

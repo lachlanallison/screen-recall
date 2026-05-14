@@ -49,6 +49,16 @@ fn log_ollama_fallback_once(openai_base: &str, ollama_url: &str, embed_model: &s
 #[async_trait::async_trait]
 pub trait Embedder: Send + Sync {
     async fn embed(&self, text: &str) -> Result<Vec<f32>>;
+
+    /// Embed multiple texts in a batch. Default impl calls `embed` sequentially.
+    /// Override for backends (e.g. OpenAI) that support native batching.
+    async fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        let mut out = Vec::with_capacity(texts.len());
+        for t in texts {
+            out.push(self.embed(t).await?);
+        }
+        Ok(out)
+    }
 }
 
 pub struct OllamaEmbedder {
@@ -143,6 +153,50 @@ impl Embedder for OpenAiEmbedder {
             .map(|i| i.embedding)
             .ok_or_else(|| anyhow!("openai returned empty embedding"))
     }
+
+    async fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        #[derive(Serialize)]
+        struct Req<'a> {
+            model: &'a str,
+            input: &'a [&'a str],
+        }
+        #[derive(Deserialize)]
+        struct Item {
+            embedding: Vec<f32>,
+            index: usize,
+        }
+        #[derive(Deserialize)]
+        struct Res {
+            data: Vec<Item>,
+        }
+
+        let url = format!("{}/embeddings", self.base_url.trim_end_matches('/'));
+        let mut req = self.http.post(&url).json(&Req {
+            model: &self.model,
+            input: texts,
+        });
+        if !self.api_key.is_empty() {
+            req = req.bearer_auth(&self.api_key);
+        }
+        let resp = req.send().await?;
+        let status = resp.status();
+        let body = resp.text().await?;
+        if !status.is_success() {
+            let snip: String = body.chars().take(768).collect();
+            return Err(anyhow!("HTTP {status} for {url}: {snip}"));
+        }
+        let res: Res = serde_json::from_str(&body)
+            .map_err(|e| anyhow!("OpenAI /v1/embeddings parse: {e} body: {} ", body.chars().take(200).collect::<String>()))?;
+        let mut out = vec![None; texts.len()];
+        for item in res.data {
+            if item.index < out.len() {
+                out[item.index] = Some(item.embedding);
+            }
+        }
+        out.into_iter()
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| anyhow!("openai batch embedding returned incomplete results"))
+    }
 }
 
 /// When the primary OpenAI-compatible server has no `/v1/embeddings` (HTTP 501), or you only set
@@ -176,6 +230,25 @@ impl Embedder for OpenAiWithOllamaFallback {
                 } else {
                     Err(e)
                 }
+            }
+        }
+    }
+
+    async fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        match self.openai.embed_batch(texts).await {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("501") || msg.contains("404") || msg.contains("405") || msg.contains("Not Implemented") {
+                    log_ollama_fallback_once(&self.openai.base_url, &self.ollama.base_url, &self.openai.model);
+                    // Ollama doesn't support batch; fall back to sequential
+                    let mut out = Vec::with_capacity(texts.len());
+                    for t in texts {
+                        out.push(self.ollama.embed(t).await?);
+                    }
+                    return Ok(out);
+                }
+                Err(e)
             }
         }
     }
@@ -233,11 +306,11 @@ pub async fn run_worker(
     mut rx: UnboundedReceiver<i64>,
 ) -> Result<()> {
     info!("embedding worker started");
-    let http = Client::builder()
-        .timeout(Duration::from_secs(120))
-        .build()?;
+    let http = state.http.clone();
 
     flush_pending(&state, &http).await;
+
+    let mut pending_from_channel: Vec<i64> = Vec::new();
 
     // Do not use `select!` with a sleep that is recreated each turn (it never fires while
     // recv keeps unblocking) or with `biased` that prefers recv — both starve the timer so the
@@ -256,8 +329,17 @@ pub async fn run_worker(
             }
             id = rx.recv() => {
                 match id {
-                    Some(id) => process_one(&state, &http, id).await,
+                    Some(id) => {
+                        pending_from_channel.push(id);
+                        if pending_from_channel.len() >= 16 {
+                            let ids = std::mem::take(&mut pending_from_channel);
+                            flush_batch(&state, &http, ids).await;
+                        }
+                    }
                     None => {
+                        if !pending_from_channel.is_empty() {
+                            flush_batch(&state, &http, std::mem::take(&mut pending_from_channel)).await;
+                        }
                         info!("embed channel closed; draining pending then exiting");
                         flush_pending(&state, &http).await;
                         break;
@@ -305,8 +387,7 @@ fn shrink_text_for_retry(text: &str) -> Option<String> {
     Some(chars[..new_len].iter().collect())
 }
 
-/// Drain the embed backlog in a few large batches. The old code took at most 16 every ~30s and
-/// could be starved entirely when new frame ids never stopped (timer arm never won).
+/// Drain the embed backlog, preferring batch embedding for OpenAI backends.
 async fn flush_pending(state: &SharedState, http: &Client) {
     for _ in 0..EMBED_FLUSH_MAX_ROUNDS {
         let ids = match state.store.pending_embed(EMBED_FLUSH_BATCH) {
@@ -319,15 +400,89 @@ async fn flush_pending(state: &SharedState, http: &Client) {
         if ids.is_empty() {
             return;
         }
-        for id in ids {
-            process_one(state, http, id).await;
-        }
+        flush_batch(state, http, ids).await;
     }
     warn!(
         "flush_pending: stopped after {}×{} frames in one run; will continue on the next tick",
         EMBED_FLUSH_MAX_ROUNDS,
         EMBED_FLUSH_BATCH
     );
+}
+
+/// Process a batch of pending embed frames. Tries batch API call first,
+/// falls back to sequential `process_one` on error.
+async fn flush_batch(state: &SharedState, http: &Client, ids: Vec<i64>) {
+    let mut batch: Vec<(i64, String)> = Vec::new();
+    for &id in &ids {
+        match state.store.get_ocr_text(id) {
+            Ok(Some(text)) if !text.trim().is_empty() => batch.push((id, text)),
+            Ok(Some(_)) => {
+                let _ = state.store.set_embed_done_skipped(id);
+            }
+            Ok(None) => {
+                let ocr_done = state.store.get_frame(id).ok().flatten().map(|f| f.ocr_done).unwrap_or(false);
+                if ocr_done {
+                    let _ = state.store.set_embed_done_skipped(id);
+                }
+                // Otherwise OCR still in progress — skip for now
+            }
+            Err(err) => warn!(frame_id = id, ?err, "get_ocr_text failed"),
+        }
+    }
+    if batch.is_empty() {
+        return;
+    }
+
+    let cfg = state.config();
+    let embedder = build_embedder(&cfg, http);
+    let texts: Vec<&str> = batch.iter().map(|(_, t)| t.as_str()).collect();
+
+    match embedder.embed_batch(&texts).await {
+        Ok(embeddings) => {
+            for ((id, _text), vec) in batch.into_iter().zip(embeddings) {
+                if let Err(err) = state.store.set_embedding(id, &vec) {
+                    warn!(frame_id = id, ?err, "save embedding failed");
+                }
+            }
+        }
+        Err(_) => {
+            // Batch failed (e.g. model doesn't support it); fall back to sequential per-frame
+            for (id, _text) in batch {
+                process_one(state, http, id).await;
+            }
+        }
+    }
+}
+
+async fn try_embed_with_retry(
+    embedder: &dyn Embedder,
+    text: &str,
+    frame_id: i64,
+) -> Result<Vec<f32>> {
+    let mut current = text.to_string();
+    for attempt in 0..=EMBED_TEXT_RETRY_ATTEMPTS {
+        let err = match embedder.embed(&current).await {
+            Ok(v) => return Ok(v),
+            Err(e) => e,
+        };
+        let err_s = err.to_string();
+        if !looks_like_input_too_large_error(&err_s) || attempt >= EMBED_TEXT_RETRY_ATTEMPTS {
+            return Err(err);
+        }
+        if let Some(next) = shrink_text_for_retry(&current) {
+            warn!(
+                frame_id,
+                attempt = attempt + 1,
+                before_chars = current.chars().count(),
+                after_chars = next.chars().count(),
+                "embedding input too large; retrying with shorter text"
+            );
+            current = next;
+        } else {
+            return Err(err);
+        }
+    }
+    unreachable!()
 }
 
 async fn process_one(state: &SharedState, http: &Client, id: i64) {
@@ -390,79 +545,33 @@ async fn process_one(state: &SharedState, http: &Client, id: i64) {
 
     let cfg = state.config();
     let embedder = build_embedder(&cfg, http);
-    let mut embed_text = text.clone();
-    let mut shrinks = 0usize;
-
-    loop {
-        match embedder.embed(&embed_text).await {
+    match try_embed_with_retry(&*embedder, &text, id).await {
         Ok(vec) => {
             if let Err(err) = state.store.set_embedding(id, &vec) {
                 warn!(frame_id = id, ?err, "save embedding failed");
                 let ms = started.elapsed().as_millis() as u64;
-                perf_log::record(
-                    state,
-                    "embed_error",
-                    serde_json::json!({
-                        "frame_id": id,
-                        "ms": ms,
-                        "error": err.to_string(),
-                    }),
-                );
+                perf_log::record(state, "embed_error", serde_json::json!({
+                    "frame_id": id, "ms": ms, "error": err.to_string(),
+                }));
                 state.worker_activity.record_embed_ms(ms);
             } else {
                 debug!(frame_id = id, dim = vec.len(), "embedded");
                 let ms = started.elapsed().as_millis() as u64;
-                perf_log::record(
-                    state,
-                    "embed_ok",
-                    serde_json::json!({
-                        "frame_id": id,
-                        "dim": vec.len(),
-                        "chars": text.len(),
-                        "request_chars": embed_text.len(),
-                        "input_shrinks": shrinks,
-                        "ms": ms,
-                    }),
-                );
+                perf_log::record(state, "embed_ok", serde_json::json!({
+                    "frame_id": id, "dim": vec.len(), "chars": text.len(),
+                    "request_chars": text.len(), "input_shrinks": 0, "ms": ms,
+                }));
                 state.worker_activity.record_embed_ms(ms);
             }
-            break;
         }
         Err(err) => {
-            let err_s = err.to_string();
-            if looks_like_input_too_large_error(&err_s) && shrinks < EMBED_TEXT_RETRY_ATTEMPTS {
-                if let Some(next) = shrink_text_for_retry(&embed_text) {
-                    let before = embed_text.chars().count();
-                    let after = next.chars().count();
-                    shrinks += 1;
-                    warn!(
-                        frame_id = id,
-                        attempt = shrinks,
-                        before_chars = before,
-                        after_chars = after,
-                        "embedding input too large; retrying with shorter text"
-                    );
-                    embed_text = next;
-                    continue;
-                }
-            }
-            // Don't mark embed_done so we'll retry later (e.g. if Ollama is down).
             let ms = started.elapsed().as_millis() as u64;
             warn!(frame_id = id, ?err, "embedding call failed");
-            perf_log::record(
-                state,
-                "embed_error",
-                serde_json::json!({
-                    "frame_id": id,
-                    "ms": ms,
-                    "error": err_s,
-                    "request_chars": embed_text.len(),
-                    "input_shrinks": shrinks,
-                }),
-            );
+            perf_log::record(state, "embed_error", serde_json::json!({
+                "frame_id": id, "ms": ms, "error": err.to_string(),
+                "request_chars": text.len(), "input_shrinks": 0,
+            }));
             state.worker_activity.record_embed_ms(ms);
-            break;
-        }
         }
     }
 }

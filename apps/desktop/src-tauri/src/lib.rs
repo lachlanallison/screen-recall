@@ -177,66 +177,43 @@ pub fn run() {
                         return;
                     }
                     let cwd = cfg.managed_server_working_dir.clone();
-                    if cfg.managed_chat_server_autostart {
-                        if let Some(cmd) = cfg.managed_chat_server_command.filter(|s| !s.trim().is_empty()) {
-                            let out_dir = state.config().data_dir.join("managed-llama");
-                            let stdout_path = out_dir.join("chat.stdout.log");
-                            let stderr_path = out_dir.join("chat.stderr.log");
-                            process_log::record(
-                                &state,
-                                "managed_llama_autostart",
-                                "custom_command",
-                                std::slice::from_ref(&cmd),
-                                cwd.as_deref(),
-                            );
-                            match crate::state::shell_spawn(&cmd, cwd.as_deref(), &stdout_path, &stderr_path) {
-                                Ok(child) => {
-                                    state.managed_llama.lock().await.insert(
-                                        "chat".into(),
-                                        crate::state::ManagedLlamaProcess {
-                                            command: cmd,
-                                            cwd: cwd.clone(),
-                                            started_at: std::time::Instant::now(),
-                                            stdout_path: stdout_path.to_string_lossy().to_string(),
-                                            stderr_path: stderr_path.to_string_lossy().to_string(),
-                                            child,
-                                        },
-                                    );
-                                    info!("managed chat server auto-started");
-                                }
-                                Err(err) => warn!(?err, "managed chat server auto-start failed"),
-                            }
+
+                    for (kind, command, autostart) in [
+                        ("chat", cfg.managed_chat_server_command.as_deref(), cfg.managed_chat_server_autostart),
+                        ("embed", cfg.managed_embed_server_command.as_deref(), cfg.managed_embed_server_autostart),
+                    ] {
+                        if !autostart {
+                            continue;
                         }
-                    }
-                    if cfg.managed_embed_server_autostart {
-                        if let Some(cmd) = cfg.managed_embed_server_command.filter(|s| !s.trim().is_empty()) {
-                            let out_dir = state.config().data_dir.join("managed-llama");
-                            let stdout_path = out_dir.join("embed.stdout.log");
-                            let stderr_path = out_dir.join("embed.stderr.log");
-                            process_log::record(
-                                &state,
-                                "managed_llama_autostart",
-                                "custom_command",
-                                std::slice::from_ref(&cmd),
-                                cwd.as_deref(),
-                            );
-                            match crate::state::shell_spawn(&cmd, cwd.as_deref(), &stdout_path, &stderr_path) {
-                                Ok(child) => {
-                                    state.managed_llama.lock().await.insert(
-                                        "embed".into(),
-                                        crate::state::ManagedLlamaProcess {
-                                            command: cmd,
-                                            cwd: cwd.clone(),
-                                            started_at: std::time::Instant::now(),
-                                            stdout_path: stdout_path.to_string_lossy().to_string(),
-                                            stderr_path: stderr_path.to_string_lossy().to_string(),
-                                            child,
-                                        },
-                                    );
-                                    info!("managed embed server auto-started");
-                                }
-                                Err(err) => warn!(?err, "managed embed server auto-start failed"),
+                        let Some(cmd) = command.filter(|s| !s.trim().is_empty()) else {
+                            continue;
+                        };
+                        let out_dir = state.config().data_dir.join("managed-llama");
+                        let stdout_path = out_dir.join(format!("{kind}.stdout.log"));
+                        let stderr_path = out_dir.join(format!("{kind}.stderr.log"));
+                        process_log::record(
+                            &state,
+                            "managed_llama_autostart",
+                            "custom_command",
+                            &[cmd.to_string()],
+                            cwd.as_deref(),
+                        );
+                        match crate::state::shell_spawn(cmd, cwd.as_deref(), &stdout_path, &stderr_path) {
+                            Ok(child) => {
+                                state.managed_llama.lock().await.insert(
+                                    kind.to_string(),
+                                    crate::state::ManagedLlamaProcess {
+                                        command: cmd.to_string(),
+                                        cwd: cwd.clone(),
+                                        started_at: std::time::Instant::now(),
+                                        stdout_path: stdout_path.to_string_lossy().to_string(),
+                                        stderr_path: stderr_path.to_string_lossy().to_string(),
+                                        child,
+                                    },
+                                );
+                                info!("managed {kind} server auto-started");
                             }
+                            Err(err) => warn!(?err, "managed {kind} server auto-start failed"),
                         }
                     }
                 });
@@ -387,6 +364,7 @@ pub fn run() {
             commands::get_capture_perf,
             commands::get_disk_status,
             commands::get_encoder_availability,
+            commands::get_known_encoders,
             commands::refresh_encoder_availability,
             commands::get_archiver_status,
             commands::archive_history_now,

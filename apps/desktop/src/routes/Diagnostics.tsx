@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import { api } from "../lib/api";
+import { formatBytes } from "../lib/format";
 import type {
   AppConfig,
   ArchiverStatus,
@@ -137,14 +138,6 @@ function WorkerQueueBar({
   );
 }
 
-function formatBytes(bytes: number): string {
-  if (bytes === 0) return "0 B";
-  const k = 1024;
-  const sizes = ["B", "KB", "MB", "GB", "TB"];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + " " + sizes[i];
-}
-
 export default function Diagnostics() {
   const [loading, setLoading] = useState(false);
   const [version, setVersion] = useState("");
@@ -222,7 +215,7 @@ export default function Diagnostics() {
       ...(stats
         ? [
             `Frames: ${stats.frameCount ?? 0} · Disk: ${formatBytes(stats.diskBytes ?? 0)} · Indexed: ${stats.indexedCount ?? 0} · Days recorded: ${stats.daysRecorded ?? 0}`,
-            `Unarchived: ${stats.unarchivedCount ?? 0} · Archived: ${stats.archivedCount ?? 0} · Pending deletion: ${stats.pendingDeletionCount ?? 0}`,
+            `Unarchived: ${stats.unarchivedCount ?? 0} · Archived: ${stats.archivedCount ?? 0} · Pending deletion: ${stats.pendingDeletionCount ?? 0} (${formatBytes(stats.pendingDeletionDiskBytes ?? 0)})`,
             "",
           ]
         : []),
@@ -416,7 +409,7 @@ export default function Diagnostics() {
             <span className="text-text-faint">Archived:</span>
             <span className="font-medium text-text">{(stats.archivedCount ?? 0).toLocaleString()}</span>
             <span className="text-text-faint">Pending deletion:</span>
-            <span className="font-medium text-text">{(stats.pendingDeletionCount ?? 0).toLocaleString()}</span>
+            <span className="font-medium text-text">{(stats.pendingDeletionCount ?? 0).toLocaleString()} ({formatBytes(stats.pendingDeletionDiskBytes ?? 0)})</span>
           </div>
         </div>
       )}
@@ -686,6 +679,14 @@ export default function Diagnostics() {
                   {archiver.lastRunTs
                     ? `${new Date(archiver.lastRunTs).toLocaleTimeString()} · ${archiver.lastDurationMs ? `${archiver.lastDurationMs}ms` : "unknown duration"}`
                     : "never"}
+                </div>
+              </div>
+              <div className="space-y-1 rounded border border-border/60 bg-bg p-3">
+                <div className="font-medium text-text">Next run</div>
+                <div className="text-text-muted">
+                  {archiver.nextRunTs
+                    ? new Date(archiver.nextRunTs).toLocaleTimeString()
+                    : archiver.running ? "running" : "pending"}
                 </div>
               </div>
               <div className="space-y-1 rounded border border-border/60 bg-bg p-3">

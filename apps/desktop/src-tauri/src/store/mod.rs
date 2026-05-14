@@ -31,6 +31,8 @@ pub struct Frame {
     pub video_path: Option<String>,
     /// Millisecond offset into `video_path` where this frame lives.
     pub video_offset_ms: Option<i64>,
+    /// Unix ms when this frame was archived to video (null = not archived).
+    pub archived_at: Option<i64>,
 }
 
 pub struct Store {
@@ -49,8 +51,8 @@ impl Store {
              PRAGMA synchronous=NORMAL;
              PRAGMA foreign_keys=ON;
              PRAGMA temp_store=MEMORY;
-             -- Embedding blobs make the DB file huge;SQLite's default mmap can map GBs → RSS blows up.
-             PRAGMA mmap_size=67108864;
+              -- Embedding blobs make the DB file huge;SQLite's default mmap can map GBs → RSS blows up.
+              PRAGMA mmap_size=134217728;
              -- Page cache (~8 MiB) — enough for indexer/hot-path without holding entire DB RAM.
              PRAGMA cache_size=-8192;",
         )?;
@@ -58,6 +60,8 @@ impl Store {
         migrate_frames_static_until(&conn)?;
         migrate_frames_video_columns(&conn)?;
         backfill_embed_done_for_empty_ocr(&conn)?;
+        migrate_archived_at(&conn)?;
+        migrate_unarchived_index(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -117,7 +121,7 @@ impl Store {
             "SELECT f.id, f.ts, f.path, f.app, f.window_title, f.monitor_id, f.ocr_done, f.embed_done,
                     COALESCE(f.static_until_ms, f.ts) AS static_until_ms,
                     EXISTS(SELECT 1 FROM embeddings e WHERE e.frame_id = f.id) AS has_embedding,
-                    f.video_path, f.video_offset_ms
+                    f.video_path, f.video_offset_ms, f.archived_at
              FROM frames f
              WHERE (?1 IS NULL OR f.ts < ?1)
              ORDER BY f.ts DESC
@@ -136,7 +140,7 @@ impl Store {
                 "SELECT f.id, f.ts, f.path, f.app, f.window_title, f.monitor_id, f.ocr_done, f.embed_done,
                         COALESCE(f.static_until_ms, f.ts) AS static_until_ms,
                         EXISTS(SELECT 1 FROM embeddings e WHERE e.frame_id = f.id) AS has_embedding,
-                        f.video_path, f.video_offset_ms
+                        f.video_path, f.video_offset_ms, f.archived_at
                  FROM frames f WHERE f.id = ?1",
                 params![id],
                 row_to_frame,
@@ -214,22 +218,44 @@ impl Store {
 
     /// Full-text search on OCR text. Returns (frame, snippet, score) tuples.
     pub fn fts_search(&self, query: &str, limit: i64) -> Result<Vec<(Frame, String, f32)>> {
+        self.fts_search_range(query, limit, None, None)
+    }
+
+    pub fn fts_search_range(
+        &self,
+        query: &str,
+        limit: i64,
+        start_ts: Option<i64>,
+        end_ts: Option<i64>,
+    ) -> Result<Vec<(Frame, String, f32)>> {
         let guard = self.conn.lock().unwrap();
-        let mut stmt = guard.prepare(
+        let mut sql = String::from(
             "SELECT f.id, f.ts, f.path, f.app, f.window_title, f.monitor_id, f.ocr_done, f.embed_done,
                     COALESCE(f.static_until_ms, f.ts) AS s_until,
                     EXISTS(SELECT 1 FROM embeddings e WHERE e.frame_id = f.id) AS has_embedding,
-                    f.video_path, f.video_offset_ms,
+                    f.video_path, f.video_offset_ms, f.archived_at,
                     snippet(ocr_text, 0, '<<', '>>', '…', 16) AS snip,
                     bm25(ocr_text) AS score
              FROM ocr_text
              JOIN frames f ON f.id = ocr_text.frame_id
-             WHERE ocr_text.text MATCH ?1
-             ORDER BY score ASC
-             LIMIT ?2",
-        )?;
+             WHERE ocr_text.text MATCH ?1",
+        );
+        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(query.to_string())];
+        if let Some(ts) = start_ts {
+            sql.push_str(" AND f.ts >= ?");
+            param_values.push(Box::new(ts));
+        }
+        if let Some(ts) = end_ts {
+            sql.push_str(" AND f.ts <= ?");
+            param_values.push(Box::new(ts));
+        }
+        sql.push_str(" ORDER BY score ASC LIMIT ?");
+        param_values.push(Box::new(limit));
+
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> = param_values.iter().map(|p| p.as_ref()).collect();
+        let mut stmt = guard.prepare(&sql)?;
         let rows = stmt
-            .query_map(params![query, limit], |row| {
+            .query_map(params_ref.as_slice(), |row| {
                 let static_until_ms: i64 = row.get(8)?;
                 let has_embedding: i32 = row.get(9)?;
                 let frame = Frame {
@@ -245,9 +271,10 @@ impl Store {
                     static_until_ms,
                     video_path: row.get(10)?,
                     video_offset_ms: row.get(11)?,
+                    archived_at: row.get(12)?,
                 };
-                let snippet: String = row.get(12)?;
-                let raw: f64 = row.get(13)?;
+                let snippet: String = row.get(13)?;
+                let raw: f64 = row.get(14)?;
                 let score = 1.0 / (1.0 + (raw.abs() as f32));
                 Ok((frame, snippet, score))
             })?
@@ -274,12 +301,25 @@ impl Store {
         Ok(())
     }
 
-    /// Walk every embedding and compute cosine similarity with `query`.
-    /// Returns top-`limit` frames with scores.
+    const SEMANTIC_SCAN_CAP: i64 = 10_000;
+
+    /// Walk embeddings and compute cosine similarity with `query`.
+    /// Scans at most `SEMANTIC_SCAN_CAP` recent indexed frames to avoid unbounded memory
+    /// on large DBs. Returns top-`limit` frames with scores.
     pub fn semantic_search(
         &self,
         query: &[f32],
         limit: usize,
+    ) -> Result<Vec<(Frame, f32)>> {
+        self.semantic_search_range(query, limit, None, None)
+    }
+
+    pub fn semantic_search_range(
+        &self,
+        query: &[f32],
+        limit: usize,
+        start_ts: Option<i64>,
+        end_ts: Option<i64>,
     ) -> Result<Vec<(Frame, f32)>> {
         use byteorder::{LittleEndian, ReadBytesExt};
         use std::io::Cursor;
@@ -290,15 +330,30 @@ impl Store {
         }
 
         let guard = self.conn.lock().unwrap();
-        let mut stmt = guard.prepare(
+        let mut sql = String::from(
             "SELECT f.id, f.ts, f.path, f.app, f.window_title, f.monitor_id, f.ocr_done, f.embed_done,
                     COALESCE(f.static_until_ms, f.ts) AS s_until,
-                    f.video_path, f.video_offset_ms,
+                    f.video_path, f.video_offset_ms, f.archived_at,
                     e.dim, e.vector
              FROM embeddings e
-             JOIN frames f ON f.id = e.frame_id",
-        )?;
-        let rows = stmt.query_map([], |row| {
+             JOIN frames f ON f.id = e.frame_id
+             WHERE 1=1",
+        );
+        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        if let Some(ts) = start_ts {
+            sql.push_str(" AND f.ts >= ?");
+            param_values.push(Box::new(ts));
+        }
+        if let Some(ts) = end_ts {
+            sql.push_str(" AND f.ts <= ?");
+            param_values.push(Box::new(ts));
+        }
+        sql.push_str(" ORDER BY f.ts DESC LIMIT ?");
+        param_values.push(Box::new(Self::SEMANTIC_SCAN_CAP));
+
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> = param_values.iter().map(|p| p.as_ref()).collect();
+        let mut stmt = guard.prepare(&sql)?;
+        let rows = stmt.query_map(params_ref.as_slice(), |row| {
             let static_until_ms: i64 = row.get(8)?;
             let frame = Frame {
                 id: row.get(0)?,
@@ -313,9 +368,10 @@ impl Store {
                 static_until_ms,
                 video_path: row.get(9)?,
                 video_offset_ms: row.get(10)?,
+                archived_at: row.get(11)?,
             };
-            let dim: i64 = row.get(11)?;
-            let blob: Vec<u8> = row.get(12)?;
+            let dim: i64 = row.get(12)?;
+            let blob: Vec<u8> = row.get(13)?;
             Ok((frame, dim, blob))
         })?;
 
@@ -325,15 +381,26 @@ impl Store {
             if dim as usize != query.len() {
                 continue;
             }
-            let mut v = Vec::with_capacity(query.len());
             let mut cur = Cursor::new(&blob);
             let mut dot = 0f32;
             let mut vn = 0f32;
-            for i in 0..query.len() {
+            let n = query.len();
+            let mut i = 0;
+            // Manual 4× unrolling for SIMD-friendly dot product
+            while i + 4 <= n {
+                let x0 = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
+                let x1 = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
+                let x2 = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
+                let x3 = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
+                dot += x0 * query[i] + x1 * query[i + 1] + x2 * query[i + 2] + x3 * query[i + 3];
+                vn += x0 * x0 + x1 * x1 + x2 * x2 + x3 * x3;
+                i += 4;
+            }
+            while i < n {
                 let x = cur.read_f32::<LittleEndian>().unwrap_or(0.0);
-                v.push(x);
                 dot += x * query[i];
                 vn += x * x;
+                i += 1;
             }
             let denom = q_norm * vn.sqrt();
             if denom == 0.0 {
@@ -493,26 +560,27 @@ impl Store {
         &self,
         video_path: &str,
         offsets: &[(i64, i64)],
+        archived_at_ms: i64,
     ) -> Result<()> {
         let guard = self.conn.lock().unwrap();
         let mut stmt = guard.prepare(
-            "UPDATE frames SET video_path = ?1, video_offset_ms = ?2 WHERE id = ?3",
+            "UPDATE frames SET video_path = ?1, video_offset_ms = ?2, archived_at = ?3 WHERE id = ?4",
         )?;
         for (id, offset) in offsets {
-            stmt.execute(params![video_path, offset, id])?;
+            stmt.execute(params![video_path, offset, archived_at_ms, id])?;
         }
         Ok(())
     }
 
-    /// Delete individual frame files for frames that have been archived to video.
+    /// Delete source frame files for frames archived more than `before_archived_at_ms` ago.
     /// Returns the paths that were deleted.
-    pub fn delete_archived_frame_files(&self, before_ts: i64) -> Result<Vec<String>> {
+    pub fn delete_expired_source_files(&self, before_archived_at_ms: i64) -> Result<Vec<String>> {
         let guard = self.conn.lock().unwrap();
         let mut stmt = guard.prepare(
-            "SELECT path FROM frames WHERE video_path IS NOT NULL AND ts < ?1",
+            "SELECT path FROM frames WHERE archived_at IS NOT NULL AND archived_at < ?1",
         )?;
         let paths: Vec<String> = stmt
-            .query_map(params![before_ts], |row| row.get(0))?
+            .query_map(params![before_archived_at_ms], |row| row.get(0))?
             .collect::<Result<Vec<_>, _>>()?;
         drop(stmt);
         for p in &paths {
@@ -545,14 +613,28 @@ impl Store {
 
     /// Count of archived frames whose source files are still on disk
     /// (i.e. archived but not yet old enough to delete).
-    pub fn pending_deletion_frame_count(&self, keep_cutoff_ms: i64) -> Result<i64> {
+    /// `before_archived_at_ms`: frames archived before this time are eligible for deletion.
+    pub fn pending_deletion_frame_count(&self, before_archived_at_ms: i64) -> Result<i64> {
         let guard = self.conn.lock().unwrap();
         let n: i64 = guard.query_row(
-            "SELECT COUNT(*) FROM frames WHERE video_path IS NOT NULL AND ts >= ?1",
-            params![keep_cutoff_ms],
+            "SELECT COUNT(*) FROM frames WHERE archived_at IS NOT NULL AND archived_at >= ?1",
+            params![before_archived_at_ms],
             |r| r.get(0),
         )?;
         Ok(n)
+    }
+
+    /// Total on-disk size of archived frame source files that are still past the keep threshold.
+    /// `before_archived_at_ms`: frames archived before this time are eligible for deletion.
+    pub fn pending_deletion_disk_bytes(&self, before_archived_at_ms: i64) -> Result<u64> {
+        let guard = self.conn.lock().unwrap();
+        let mut stmt = guard.prepare(
+            "SELECT path FROM frames WHERE archived_at IS NOT NULL AND archived_at >= ?1",
+        )?;
+        let paths: Vec<String> = stmt
+            .query_map(params![before_archived_at_ms], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(crate::util::disk::sum_file_sizes(&paths))
     }
 
     /// List all distinct video paths that have been archived.
@@ -576,13 +658,7 @@ impl Store {
         let paths: Vec<String> = stmt
             .query_map([], |row| row.get(0))?
             .collect::<Result<Vec<_>, _>>()?;
-        let mut total: u64 = 0;
-        for p in &paths {
-            if let Ok(m) = std::fs::metadata(p) {
-                total += m.len();
-            }
-        }
-        Ok(total)
+        Ok(crate::util::disk::sum_file_sizes(&paths))
     }
 
     /// List distinct monitor IDs that have unarchived frames before `cutoff_ms`.
@@ -672,6 +748,7 @@ fn row_to_frame(row: &rusqlite::Row<'_>) -> rusqlite::Result<Frame> {
         has_embedding: row.get::<_, i32>(9)? != 0,
         video_path: row.get(10)?,
         video_offset_ms: row.get(11)?,
+        archived_at: row.get(12)?,
     })
 }
 
@@ -721,6 +798,30 @@ fn migrate_frames_video_columns(conn: &Connection) -> Result<()> {
             .with_context(|| format!("add {} to frames", col))?;
         }
     }
+    Ok(())
+}
+
+fn migrate_archived_at(conn: &Connection) -> Result<()> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('frames') WHERE name = 'archived_at'",
+        [],
+        |r| r.get(0),
+    )?;
+    if n == 0 {
+        conn.execute("ALTER TABLE frames ADD COLUMN archived_at INTEGER", [])
+            .context("add archived_at to frames")?;
+    }
+    Ok(())
+}
+
+fn migrate_unarchived_index(conn: &Connection) -> Result<()> {
+    // Partial index covering the archiver's hot path: frames ready to archive.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_frames_unarchived_ready
+         ON frames(monitor_id, ts)
+         WHERE video_path IS NULL AND ocr_done = 1 AND embed_done = 1",
+        [],
+    )?;
     Ok(())
 }
 

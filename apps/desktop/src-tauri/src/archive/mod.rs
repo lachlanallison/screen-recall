@@ -171,7 +171,7 @@ async fn find_ffmpeg_via_where() -> Option<String> {
 }
 
 /// Search PATH first, then common install locations for ffmpeg binary.
-async fn find_ffmpeg_binary() -> Option<String> {
+pub async fn find_ffmpeg_binary() -> Option<String> {
     if verify_ffmpeg("ffmpeg").await {
         return Some("ffmpeg".into());
     }
@@ -332,6 +332,7 @@ pub struct ArchiverStatus {
     pub running: bool,
     pub last_run_ts: Option<i64>,
     pub last_duration_ms: Option<u64>,
+    pub next_run_ts: Option<i64>,
     pub total_archived: i64,
     pub total_segments: i64,
     pub total_source_deleted: i64,
@@ -343,6 +344,7 @@ static ARCHIVER_STATUS: Mutex<ArchiverStatus> = Mutex::new(ArchiverStatus {
     running: false,
     last_run_ts: None,
     last_duration_ms: None,
+    next_run_ts: None,
     total_archived: 0,
     total_segments: 0,
     total_source_deleted: 0,
@@ -359,12 +361,10 @@ fn set_archiver_status(f: impl FnOnce(&mut ArchiverStatus)) {
     }
 }
 
-/// Main archiver worker loop. Sleeps for `archive_interval_secs` between runs.
+/// Main archiver worker loop. Runs immediately, then sleeps for `archive_interval_secs`.
 pub async fn run_worker(state: SharedState) -> Result<()> {
     info!("archiver worker started");
 
-    // Initialise status from config so the UI doesn't show "disabled" at startup
-    // before the first run cycle completes.
     let cfg = state.config();
     if cfg.archive_enabled {
         set_archiver_status(|s| {
@@ -375,40 +375,36 @@ pub async fn run_worker(state: SharedState) -> Result<()> {
 
     loop {
         let cfg = state.config();
-        let sleep_secs = cfg.archive_interval_secs.max(60);
-        tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
-
-        let cfg = state.config();
         if !cfg.archive_enabled {
             set_archiver_status(|s| {
                 s.enabled = false;
                 s.running = false;
             });
+            let sleep_secs = cfg.archive_interval_secs.max(60);
+            set_archiver_status(|s| s.next_run_ts = Some(Utc::now().timestamp_millis() + sleep_secs as i64 * 1000));
+            tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
             continue;
         }
-        let now = Utc::now().timestamp_millis();
-        let cutoff = now - (cfg.archive_interval_secs as i64 * 1000);
-
-        // Archive everything since the last successful run so gaps (shutdown,
-        // weekend, etc.) don't leave frames unarchived.
-        let status = get_archiver_status();
-        let min_ts = match status.last_run_ts {
-            Some(ts) => {
-                if cfg.archive_max_lookback_secs > 0 {
-                    // Safety cap: don't look further back than configured.
-                    ts.max(now - (cfg.archive_max_lookback_secs as i64 * 1000))
-                } else {
-                    ts
-                }
-            }
-            None => 0,
-        };
 
         set_archiver_status(|s| {
             s.enabled = true;
             s.running = true;
             s.last_error = None;
         });
+
+        let now = Utc::now().timestamp_millis();
+        let status = get_archiver_status();
+        let min_ts = match status.last_run_ts {
+            Some(ts) => {
+                if cfg.archive_max_lookback_secs > 0 {
+                    ts.max(now - (cfg.archive_max_lookback_secs as i64 * 1000))
+                } else {
+                    ts
+                }
+            }
+            None => now - (cfg.archive_interval_secs as i64 * 1000).max(60_000),
+        };
+        let cutoff = now - 1000;
 
         let started = std::time::Instant::now();
         match archive_segment(&state, cutoff, min_ts, now, &cfg).await {
@@ -424,6 +420,16 @@ pub async fn run_worker(state: SharedState) -> Result<()> {
                 if archived > 0 {
                     info!(archived, segments, "archiver run complete");
                 }
+                if cfg.archive_keep_frames_days > 0 {
+                    let cut = now - (cfg.archive_keep_frames_days as i64 * 24 * 3600 * 1000);
+                    if let Ok(deleted) = state.store.delete_expired_source_files(cut) {
+                        let n = deleted.len();
+                        if n > 0 {
+                            set_archiver_status(|s| s.total_source_deleted += n as i64);
+                            info!(deleted = n, "deleted archived source files past keep threshold");
+                        }
+                    }
+                }
             }
             Err(e) => {
                 set_archiver_status(|s| {
@@ -433,6 +439,10 @@ pub async fn run_worker(state: SharedState) -> Result<()> {
                 warn!(?e, "archiver run failed");
             }
         }
+
+        let sleep_secs = cfg.archive_interval_secs.max(60);
+        set_archiver_status(|s| s.next_run_ts = Some(Utc::now().timestamp_millis() + sleep_secs as i64 * 1000));
+        tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
     }
 }
 
@@ -489,7 +499,7 @@ async fn archive_segment(
 
     let mut total_archived = 0;
     let mut total_segments = 0;
-    let mut total_deleted = 0;
+    let total_deleted = 0;
     let video_dir = state.config().data_dir.join("videos");
     std::fs::create_dir_all(&video_dir)?;
 
@@ -527,7 +537,7 @@ async fn archive_segment(
             let duration_s = ((last_ts - first_ts) as f64 / 1000.0).max(0.5);
 
             // Build video path: videos/YYYY/MM/DD/HHMMSS_m{monitor}.mp4
-            let first_frame_ts = frames[0].1;
+            let first_frame_ts = segment[0].1;
             let dt = chrono::DateTime::<Utc>::from_timestamp_millis(first_frame_ts)
                 .unwrap_or_else(|| chrono::Utc::now());
             let rel = format!(
@@ -567,23 +577,34 @@ async fn archive_segment(
             // Run ffmpeg.
             // WebP captures may have alpha (ARGB); force conversion to yuv420p via
             // filter so the output is not black in standard players.
-            // We do NOT use -r here — the concat demuxer durations drive the timing.
+            // JPEG frames are already RGB — skip the filter to avoid unnecessary CPU work.
+            let has_webp = segment.iter().any(|(_, _, path)| {
+                path.to_ascii_lowercase().ends_with(".webp")
+            });
             let encoder = &preset.ffmpeg_encoder;
             let ffmpeg_bin = find_ffmpeg_binary().await
                 .ok_or_else(|| anyhow!("ffmpeg not found in PATH or common install locations"))?;
+            let list_path_str = list_path.to_string_lossy().to_string();
+            let video_path_str = video_path.to_string_lossy().to_string();
             let mut cmd = Command::new(&ffmpeg_bin);
-            cmd.args([
+            let mut args: Vec<&str> = vec![
                 "-y",
                 "-f", "concat",
                 "-safe", "0",
-                "-i", &list_path.to_string_lossy(),
-                "-vf", "format=yuv420p",
+                "-i", &list_path_str,
+            ];
+            if has_webp {
+                args.push("-vf");
+                args.push("format=yuv420p");
+            }
+            args.extend_from_slice(&[
                 "-c:v", encoder,
                 "-preset", "veryfast",
                 "-vsync", "vfr",
                 "-pix_fmt", "yuv420p",
-                &video_path.to_string_lossy(),
             ]);
+            args.push(&video_path_str);
+            cmd.args(&args);
             configure_hidden_tokio(&mut cmd);
             cmd.stdin(Stdio::null());
             cmd.stdout(Stdio::piped());
@@ -601,23 +622,12 @@ async fn archive_segment(
                 return Err(anyhow!("ffmpeg failed: {}", tail.join(" | ")));
             }
 
-            // Update DB: set video_path and video_offset_ms for each frame.
+            // Update DB: set video_path, video_offset_ms, and archived_at for each frame.
             let offsets: Vec<(i64, i64)> = segment
                 .iter()
                 .map(|(id, offset_ms, _)| (*id, *offset_ms))
                 .collect();
-            state.store.set_video_archive(&video_path.to_string_lossy(), &offsets)?;
-
-            // Delete source files older than the keep threshold.
-            if cfg.archive_keep_frames_days > 0 {
-                let keep_cutoff_ms = now_ms - (cfg.archive_keep_frames_days as i64 * 24 * 3600 * 1000);
-                for (_, ts, frame_path) in segment {
-                    if *ts < keep_cutoff_ms {
-                        let _ = std::fs::remove_file(frame_path);
-                        total_deleted += 1;
-                    }
-                }
-            }
+            state.store.set_video_archive(&video_path.to_string_lossy(), &offsets, now_ms)?;
 
             total_archived += segment.len();
             total_segments += 1;

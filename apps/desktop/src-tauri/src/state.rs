@@ -5,6 +5,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
+use reqwest::Client;
 use tauri::AppHandle;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc;
@@ -41,6 +42,7 @@ pub struct ManagedLlamaLast {
 pub struct AppState {
     pub app: AppHandle,
     pub store: Store,
+    pub http: Client,
     /// Current config. RW-locked for hot updates from Settings.
     config: RwLock<AppConfig>,
     config_path: PathBuf,
@@ -56,17 +58,8 @@ pub struct AppState {
     pub managed_llama: AsyncMutex<std::collections::HashMap<String, ManagedLlamaProcess>>,
     /// Last known exit details for managed servers.
     pub managed_llama_last: AsyncMutex<std::collections::HashMap<String, ManagedLlamaLast>>,
-    /// Cached on-disk frames size in bytes; maintained by a background refresher.
-    cached_disk_bytes: std::sync::Mutex<u64>,
-    /// Cached counts for cheap `get_stats` reads.
-    cached_frame_count: std::sync::Mutex<i64>,
-    cached_indexed_count: std::sync::Mutex<i64>,
-    /// Cached unarchived frame disk bytes for cheap `get_health_snapshot` reads.
-    cached_unarchived_bytes: std::sync::Mutex<u64>,
-    /// Cached archived frame count for cheap `get_health_snapshot` reads.
-    cached_archived_count: std::sync::Mutex<i64>,
-    /// Cached unarchived frame count for cheap `get_stats` reads.
-    cached_unarchived_count: std::sync::Mutex<i64>,
+    /// Cached DB/file stats refreshed by background task.
+    cache: RwLock<StatsCache>,
     /// Rolling per-phase capture performance samples for Diagnostics.
     pub capture_perf: std::sync::Arc<CapturePerf>,
     /// True when the data drive has < 10% free space.
@@ -74,7 +67,17 @@ pub struct AppState {
     /// True when the data drive has < 5% free space (recording stopped).
     disk_stopped: AtomicBool,
     /// Cached free-space percentage (0.0–100.0).
-    disk_free_pct: std::sync::Mutex<f64>,
+    disk_free_pct: RwLock<f64>,
+}
+
+#[derive(Clone, Default)]
+struct StatsCache {
+    disk_bytes: u64,
+    frame_count: i64,
+    indexed_count: i64,
+    unarchived_bytes: u64,
+    archived_count: i64,
+    unarchived_count: i64,
 }
 
 impl AppState {
@@ -88,9 +91,15 @@ impl AppState {
         let db_path = config.data_dir.join(paths::SQLITE_DB_FILE);
         let store = Store::open(&db_path)?;
 
+        let http = Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+            .context("build HTTP client")?;
+
         Ok(Self {
             app,
             store,
+            http,
             config: RwLock::new(config),
             config_path,
             recording: AtomicBool::new(true),
@@ -99,16 +108,11 @@ impl AppState {
             worker_activity: std::sync::Arc::new(WorkerActivity::default()),
             managed_llama: AsyncMutex::new(Default::default()),
             managed_llama_last: AsyncMutex::new(Default::default()),
-            cached_disk_bytes: std::sync::Mutex::new(0),
-            cached_frame_count: std::sync::Mutex::new(0),
-            cached_indexed_count: std::sync::Mutex::new(0),
-            cached_unarchived_bytes: std::sync::Mutex::new(0),
-            cached_archived_count: std::sync::Mutex::new(0),
-            cached_unarchived_count: std::sync::Mutex::new(0),
+            cache: RwLock::new(StatsCache::default()),
             capture_perf: std::sync::Arc::new(CapturePerf::default()),
             disk_warning: AtomicBool::new(false),
             disk_stopped: AtomicBool::new(false),
-            disk_free_pct: std::sync::Mutex::new(100.0),
+            disk_free_pct: RwLock::new(100.0),
         })
     }
 
@@ -149,58 +153,54 @@ impl AppState {
     }
 
     pub fn set_cached_disk_bytes(&self, bytes: u64) {
-        if let Ok(mut g) = self.cached_disk_bytes.lock() {
-            *g = bytes;
+        if let Ok(mut g) = self.cache.write() {
+            g.disk_bytes = bytes;
         }
     }
 
     pub fn cached_disk_bytes(&self) -> u64 {
-        self.cached_disk_bytes.lock().map(|g| *g).unwrap_or(0)
+        self.cache.read().map(|g| g.disk_bytes).unwrap_or(0)
     }
 
     pub fn set_cached_counts(&self, frame_count: i64, indexed_count: i64) {
-        if let Ok(mut g) = self.cached_frame_count.lock() {
-            *g = frame_count.max(0);
-        }
-        if let Ok(mut g) = self.cached_indexed_count.lock() {
-            *g = indexed_count.max(0);
+        if let Ok(mut g) = self.cache.write() {
+            g.frame_count = frame_count.max(0);
+            g.indexed_count = indexed_count.max(0);
         }
     }
 
     pub fn cached_counts(&self) -> (i64, i64) {
-        let frames = self.cached_frame_count.lock().map(|g| *g).unwrap_or(0);
-        let indexed = self.cached_indexed_count.lock().map(|g| *g).unwrap_or(0);
-        (frames, indexed)
+        self.cache.read().map(|g| (g.frame_count, g.indexed_count)).unwrap_or((0, 0))
     }
 
     pub fn set_cached_unarchived_bytes(&self, bytes: u64) {
-        if let Ok(mut g) = self.cached_unarchived_bytes.lock() {
-            *g = bytes;
+        if let Ok(mut g) = self.cache.write() {
+            g.unarchived_bytes = bytes;
         }
     }
 
     pub fn cached_unarchived_bytes(&self) -> u64 {
-        self.cached_unarchived_bytes.lock().map(|g| *g).unwrap_or(0)
+        self.cache.read().map(|g| g.unarchived_bytes).unwrap_or(0)
     }
 
     pub fn set_cached_archived_count(&self, count: i64) {
-        if let Ok(mut g) = self.cached_archived_count.lock() {
-            *g = count.max(0);
+        if let Ok(mut g) = self.cache.write() {
+            g.archived_count = count.max(0);
         }
     }
 
     pub fn cached_archived_count(&self) -> i64 {
-        self.cached_archived_count.lock().map(|g| *g).unwrap_or(0)
+        self.cache.read().map(|g| g.archived_count).unwrap_or(0)
     }
 
     pub fn set_cached_unarchived_count(&self, count: i64) {
-        if let Ok(mut g) = self.cached_unarchived_count.lock() {
-            *g = count.max(0);
+        if let Ok(mut g) = self.cache.write() {
+            g.unarchived_count = count.max(0);
         }
     }
 
     pub fn cached_unarchived_count(&self) -> i64 {
-        self.cached_unarchived_count.lock().map(|g| *g).unwrap_or(0)
+        self.cache.read().map(|g| g.unarchived_count).unwrap_or(0)
     }
 
     pub fn disk_warning(&self) -> bool {
@@ -212,13 +212,13 @@ impl AppState {
     }
 
     pub fn disk_free_pct(&self) -> f64 {
-        self.disk_free_pct.lock().map(|g| *g).unwrap_or(100.0)
+        self.disk_free_pct.read().map(|g| *g).unwrap_or(100.0)
     }
 
     pub fn set_disk_status(&self, warning: bool, stopped: bool, free_pct: f64) {
         self.disk_warning.store(warning, Ordering::Relaxed);
         self.disk_stopped.store(stopped, Ordering::Relaxed);
-        if let Ok(mut g) = self.disk_free_pct.lock() {
+        if let Ok(mut g) = self.disk_free_pct.write() {
             *g = free_pct.max(0.0).min(100.0);
         }
     }

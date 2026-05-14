@@ -1,16 +1,14 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, useCallback } from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import {
   Archive,
   ChevronLeft,
   ChevronRight,
   ExternalLink,
-  Expand,
   MessageSquarePlus,
   Send,
   Square,
   Trash2,
-  X,
 } from "lucide-react";
 import { api, type Frame } from "../lib/api";
 import {
@@ -20,6 +18,9 @@ import {
   type StoredThread,
 } from "../lib/chatStorage";
 import { openFrameWindow } from "../lib/frameWindow";
+import { FrameViewer } from "../lib/components/ImageViewer";
+import { ContextMenu } from "../lib/components/ContextMenu";
+import { useEscape } from "../lib/components/useEscape";
 
 type ChatThread = StoredThread;
 const CHAT_SIDEBAR_COLLAPSED_KEY = "screenrecall:chat-sidebar-collapsed";
@@ -64,7 +65,6 @@ export default function Chat() {
   const stallThreadRef = useRef<string | null>(null);
   const [showArchived, setShowArchived] = useState(false);
   const [viewer, setViewer] = useState<Frame | null>(null);
-  const [viewerFullscreen, setViewerFullscreen] = useState(false);
   const [menu, setMenu] = useState<{
     x: number;
     y: number;
@@ -312,22 +312,13 @@ export default function Chat() {
     };
   }, [streaming, thinking]);
 
-  useEffect(() => {
-    const onKey = (evt: KeyboardEvent) => {
-      if (evt.key === "Escape") {
-        setViewer(null);
-        setViewerFullscreen(false);
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, []);
+  const closeMenu = useCallback(() => setMenu(null), []);
+  useEscape(() => { setViewer(null); setMenu(null); });
 
   useEffect(() => {
-    const closeMenu = () => setMenu(null);
     window.addEventListener("click", closeMenu);
     return () => window.removeEventListener("click", closeMenu);
-  }, []);
+  }, [closeMenu]);
 
   const send = async () => {
     if (!hydrated || !prompt.trim() || streaming) return;
@@ -667,84 +658,29 @@ export default function Chat() {
       </div>
 
       {viewer && (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4"
-          onClick={() => {
-            setViewer(null);
-            setViewerFullscreen(false);
+        <FrameViewer
+          frame={viewer}
+          onClose={() => setViewer(null)}
+          onContextMenu={(e) => {
+            e.preventDefault();
+            setMenu({ x: e.clientX, y: e.clientY, frame: viewer });
           }}
-        >
-          <div
-            className={
-              "relative overflow-hidden rounded-lg border border-border bg-bg-elevated " +
-              (viewerFullscreen ? "h-[95vh] w-[95vw]" : "h-[80vh] w-[80vw] max-w-6xl")
-            }
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="flex items-center gap-2 border-b border-border px-3 py-2 text-xs text-text-muted">
-              <span className="truncate">{viewer.window_title ?? viewer.app ?? viewer.path}</span>
-              <button
-                type="button"
-                onClick={() => setViewerFullscreen((v) => !v)}
-                className="ml-auto rounded border border-border p-1 hover:bg-bg-hover"
-                title={viewerFullscreen ? "Exit fullscreen" : "Fullscreen"}
-              >
-                <Expand className="h-3.5 w-3.5" />
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  openFrameWindow(viewer);
-                }}
-                className="rounded border border-border p-1 hover:bg-bg-hover"
-                title="Open in new window"
-              >
-                <ExternalLink className="h-3.5 w-3.5" />
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setViewer(null);
-                  setViewerFullscreen(false);
-                }}
-                className="rounded border border-border p-1 hover:bg-bg-hover"
-                title="Close"
-              >
-                <X className="h-3.5 w-3.5" />
-              </button>
-            </div>
-            <div className="h-[calc(100%-2.25rem)] w-full bg-black">
-              <img
-                src={api.assetUrl(viewer.path)}
-                alt={viewer.window_title ?? viewer.app ?? "Captured frame"}
-                className="h-full w-full object-contain"
-                onContextMenu={(e) => {
-                  e.preventDefault();
-                  setMenu({ x: e.clientX, y: e.clientY, frame: viewer });
-                }}
-              />
-            </div>
-          </div>
-        </div>
+        />
       )}
 
       {menu && (
-        <div
-          className="fixed z-[60] min-w-44 rounded-md border border-border bg-bg-elevated p-1 shadow-lg"
-          style={{ left: menu.x, top: menu.y }}
-        >
-          <button
-            type="button"
-            onClick={() => {
-              openFrameWindow(menu.frame);
-              setMenu(null);
-            }}
-            className="flex w-full items-center gap-2 rounded px-2 py-1 text-xs hover:bg-bg-hover"
-          >
-            <ExternalLink className="h-3.5 w-3.5" />
-            Open in new window
-          </button>
-        </div>
+        <ContextMenu
+          x={menu.x}
+          y={menu.y}
+          onClose={closeMenu}
+          items={[
+            {
+              label: "Open in new window",
+              icon: <ExternalLink className="h-3.5 w-3.5" />,
+              onClick: () => openFrameWindow(menu.frame),
+            },
+          ]}
+        />
       )}
     </div>
   );

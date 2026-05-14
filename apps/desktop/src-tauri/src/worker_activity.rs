@@ -64,7 +64,7 @@ pub struct StageTimingStats {
     pub p95_ms: Option<u64>,
 }
 
-fn summarize_ms(samples: &[u64]) -> StageTimingStats {
+pub fn summarize_ms(samples: &[u64]) -> StageTimingStats {
     if samples.is_empty() {
         return StageTimingStats::default();
     }

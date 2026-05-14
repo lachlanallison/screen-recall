@@ -17,11 +17,13 @@ export type Frame = {
   /** True when a row exists in the embeddings table (searchable vector). */
   has_embedding: boolean;
   /** Last unix ms this view still matched; duration ≈ static_until_ms - ts. */
-  static_until_ms?: number;
+  static_until_ms: number;
   /** Path to archived video segment (null = still on disk as individual frame file). */
   video_path: string | null;
   /** Millisecond offset into video_path where this frame lives. */
   video_offset_ms: number | null;
+  /** Unix ms when this frame was archived to video (null = not archived). */
+  archivedAt: number | null;
 };
 
 export type SearchHit = {
@@ -57,7 +59,7 @@ export type AppConfig = {
   managed_server_working_dir: string | null;
   managed_chat_server_autostart: boolean;
   managed_embed_server_autostart: boolean;
-  ocr_engine: "tesseract" | "native" | "vision";
+  ocr_engine: "tesseract";
   setup_complete: boolean;
   /** Seconds between Timeline refreshes; 0 = manual only. */
   timeline_refresh_secs: number;
@@ -83,6 +85,8 @@ export type AppConfig = {
   capture_image_format: "jpeg" | "webp";
   /** JPEG quality (1–100). Only used when format is JPEG. */
   capture_jpeg_quality: number;
+  /** Resize filter for frame downscaling. "nearest" (default, fastest) or "lanczos3" (better OCR accuracy). */
+  capture_resize_filter: "nearest" | "lanczos3";
 };
 
 export type Stats = {
@@ -93,6 +97,7 @@ export type Stats = {
   unarchivedCount: number;
   archivedCount: number;
   pendingDeletionCount: number;
+  pendingDeletionDiskBytes: number;
 };
 
 export type OneWorkerQueue = {
@@ -190,6 +195,7 @@ export type ArchiverStatus = {
   running: boolean;
   lastRunTs: number | null;
   lastDurationMs: number | null;
+  nextRunTs: number | null;
   totalArchived: number;
   totalSegments: number;
   totalSourceDeleted: number;
@@ -199,7 +205,6 @@ export type ArchiverStatus = {
 export type PerPhaseStats = {
   sampleCount: number;
   capture: StageTimingStats;
-  hash: StageTimingStats;
   downscale: StageTimingStats;
   save: StageTimingStats;
   total: StageTimingStats;
@@ -284,6 +289,8 @@ export const api = {
     invoke<WorkerQueueSnapshot>("get_worker_queue_snapshot"),
   getEncoderAvailability: () =>
     invoke<EncoderAvailability>("get_encoder_availability"),
+  getKnownEncoders: () =>
+    invoke<EncoderPreset[]>("get_known_encoders"),
   refreshEncoderAvailability: () =>
     invoke<EncoderAvailability>("refresh_encoder_availability"),
   getArchiverStatus: () =>

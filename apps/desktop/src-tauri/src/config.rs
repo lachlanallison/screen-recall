@@ -98,6 +98,9 @@ pub struct AppConfig {
     /// JPEG quality (1–100). Only used when format is JPEG.
     #[serde(default = "default_capture_jpeg_quality")]
     pub capture_jpeg_quality: u8,
+    /// Resize filter for frame downscaling. "nearest" (default, fastest) or "lanczos3" (better OCR accuracy).
+    #[serde(default = "default_capture_resize_filter")]
+    pub capture_resize_filter: CaptureResizeFilter,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -111,8 +114,6 @@ pub enum LlmBackend {
 #[serde(rename_all = "lowercase")]
 pub enum OcrEngineKind {
     Tesseract,
-    Native,
-    Vision,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -128,6 +129,13 @@ pub enum CloseBehavior {
     Ask,
     Minimize,
     Quit,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CaptureResizeFilter {
+    Nearest,
+    Lanczos3,
 }
 
 fn default_timeline_refresh_secs() -> u64 {
@@ -178,6 +186,10 @@ fn default_capture_jpeg_quality() -> u8 {
     85
 }
 
+fn default_capture_resize_filter() -> CaptureResizeFilter {
+    CaptureResizeFilter::Nearest
+}
+
 impl AppConfig {
     pub fn default_for(data_dir: PathBuf) -> Self {
         Self {
@@ -214,6 +226,7 @@ impl AppConfig {
             capture_downscale_max_edge: default_capture_downscale_max_edge(),
             capture_image_format: default_capture_image_format(),
             capture_jpeg_quality: default_capture_jpeg_quality(),
+            capture_resize_filter: default_capture_resize_filter(),
         }
     }
 

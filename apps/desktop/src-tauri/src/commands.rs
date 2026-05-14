@@ -5,11 +5,7 @@
 //! side without needing a custom deserialization path.
 
 use std::sync::Arc;
-use std::{
-    fs::File,
-    io::{Read, Seek, SeekFrom},
-    path::Path,
-};
+use std::path::Path;
 
 use futures_util::StreamExt;
 use reqwest::Client;
@@ -25,9 +21,10 @@ use crate::llm::{self, prompts, ChatMessage};
 use crate::search;
 use crate::state::{shell_spawn, AppState, ManagedLlamaLast, ManagedLlamaProcess, OcrQueue};
 use crate::store::Frame;
+use crate::util::log_reader;
 use crate::util::paths;
 use crate::util::perf_log;
-use crate::util::process::configure_hidden_std;
+use crate::util::process::hidden_command;
 use crate::util::process_log;
 use crate::util::reveal_in_folder;
 use crate::worker_activity::{OneWorkerQueue, WorkerQueuesSnapshot};
@@ -41,49 +38,11 @@ fn err<E: std::fmt::Display>(e: E) -> String {
 }
 
 fn read_tail_lines(path: &Path, max_lines: usize, max_bytes: u64) -> std::io::Result<Vec<String>> {
-    let mut f = File::open(path)?;
-    let len = f.metadata()?.len();
-    let start = len.saturating_sub(max_bytes.max(1));
-    f.seek(SeekFrom::Start(start))?;
-    let mut buf = Vec::new();
-    f.read_to_end(&mut buf)?;
-    let text = String::from_utf8_lossy(&buf);
-    let mut lines: Vec<String> = text.lines().map(|x| x.to_string()).collect();
-    // If we started from the middle of the file, the first line may be partial/truncated.
-    if start > 0 && !lines.is_empty() {
-        lines.remove(0);
-    }
-    if lines.len() > max_lines {
-        lines.drain(0..(lines.len() - max_lines));
-    }
-    Ok(lines)
-}
-
-fn hidden_command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
-    let mut cmd = std::process::Command::new(program);
-    configure_hidden_std(&mut cmd);
-    cmd
+    log_reader::read_tail_lines(path, max_lines, max_bytes)
 }
 
 fn resolve_tesseract_for_check() -> Option<std::path::PathBuf> {
-    let candidates = [
-        std::path::PathBuf::from("tesseract.exe"),
-        std::path::PathBuf::from("tesseract"),
-        std::path::PathBuf::from(r"C:\Program Files\Tesseract-OCR\tesseract.exe"),
-        std::path::PathBuf::from(r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe"),
-    ];
-
-    for c in candidates {
-        let ok = hidden_command(&c)
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        if ok {
-            return Some(c);
-        }
-    }
-    None
+    crate::util::tesseract::find_binary()
 }
 
 #[derive(Serialize, Clone)]
@@ -411,32 +370,7 @@ fn file_metadata_len_mb(path: &std::path::Path) -> f64 {
 }
 
 fn probe_tesseract_known_path() -> Option<String> {
-    #[cfg(target_os = "windows")]
-    {
-        for p in [
-            r"C:\Program Files\Tesseract-OCR\tesseract.exe",
-            r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
-        ] {
-            let q = std::path::Path::new(p);
-            if q.is_file() {
-                return Some(p.to_string());
-            }
-        }
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        for p in [
-            "/usr/bin/tesseract",
-            "/usr/local/bin/tesseract",
-            "/opt/homebrew/bin/tesseract",
-        ] {
-            let q = std::path::Path::new(p);
-            if q.is_file() {
-                return Some(p.to_string());
-            }
-        }
-    }
-    None
+    crate::util::tesseract::probe_known_path()
 }
 
 /// Local DB sizes + managed server health + Tesseract install hint (no subprocess spawns).
@@ -470,6 +404,12 @@ pub async fn get_encoder_availability() -> CmdResult<EncoderAvailability> {
     Ok(archive::probe_encoders().await)
 }
 
+/// Return the full list of known encoder presets (single source of truth for the UI).
+#[tauri::command]
+pub fn get_known_encoders() -> CmdResult<Vec<archive::EncoderPreset>> {
+    Ok(archive::KNOWN_ENCODERS.to_vec())
+}
+
 /// Clear encoder cache and re-probe.
 #[tauri::command]
 pub async fn refresh_encoder_availability() -> CmdResult<EncoderAvailability> {
@@ -487,6 +427,45 @@ fn trim_base_url(s: &str) -> String {
     s.trim().trim_end_matches('/').to_string()
 }
 
+async fn run_connection_test(
+    method: reqwest::Method,
+    url: &str,
+    body: Option<serde_json::Value>,
+    api_key: &str,
+    timeout_secs: u64,
+) -> CmdResult<LlmConnectionTest> {
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .build()
+        .map_err(err)?;
+    let mut req = match method {
+        reqwest::Method::GET => client.get(url),
+        reqwest::Method::POST => client.post(url),
+        _ => unreachable!(),
+    };
+    if let Some(b) = &body {
+        req = req.json(b);
+    }
+    if !api_key.trim().is_empty() {
+        req = req.bearer_auth(api_key.trim());
+    }
+    let resp = req.send().await.map_err(err)?;
+    let st = resp.status();
+    let body_text = resp.text().await.unwrap_or_default();
+    let method_str = if body.is_some() { "POST" } else { "GET" };
+    if st.is_success() {
+        return Ok(LlmConnectionTest {
+            ok: true,
+            detail: format!("{} {} → {}", method_str, url, st),
+        });
+    }
+    let snippet: String = body_text.chars().take(200).collect();
+    Ok(LlmConnectionTest {
+        ok: false,
+        detail: format!("{} {} → {}: {}", method_str, url, st, snippet),
+    })
+}
+
 /// GET Ollama `/api/tags` — validates the Ollama URL used for chat/pull when backend is Ollama.
 #[tauri::command]
 pub async fn test_ollama_connection(ollama_url: String) -> CmdResult<LlmConnectionTest> {
@@ -498,24 +477,7 @@ pub async fn test_ollama_connection(ollama_url: String) -> CmdResult<LlmConnecti
         });
     }
     let url = format!("{}/api/tags", base);
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(20))
-        .build()
-        .map_err(err)?;
-    let resp = client.get(&url).send().await.map_err(err)?;
-    let st = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-    if st.is_success() {
-        return Ok(LlmConnectionTest {
-            ok: true,
-            detail: format!("GET {} → {}", url, st),
-        });
-    }
-    let snippet: String = body.chars().take(200).collect();
-    Ok(LlmConnectionTest {
-        ok: false,
-        detail: format!("GET {} → {}: {}", url, st, snippet),
-    })
+    run_connection_test(reqwest::Method::GET, &url, None, "", 20).await
 }
 
 /// GET OpenAI-compatible `/v1/models` (llama.cpp and most proxies expose this).
@@ -532,28 +494,7 @@ pub async fn test_openai_chat_connection(
         });
     }
     let url = format!("{}/models", base);
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(20))
-        .build()
-        .map_err(err)?;
-    let mut req = client.get(&url);
-    if !api_key.trim().is_empty() {
-        req = req.bearer_auth(api_key.trim());
-    }
-    let resp = req.send().await.map_err(err)?;
-    let st = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-    if st.is_success() {
-        return Ok(LlmConnectionTest {
-            ok: true,
-            detail: format!("GET {} → {}", url, st),
-        });
-    }
-    let snippet: String = body.chars().take(200).collect();
-    Ok(LlmConnectionTest {
-        ok: false,
-        detail: format!("GET {} → {}: {}", url, st, snippet),
-    })
+    run_connection_test(reqwest::Method::GET, &url, None, &api_key, 20).await
 }
 
 /// POST OpenAI-compatible `/v1/embeddings` using the same shape as the indexer.
@@ -577,43 +518,15 @@ pub async fn test_openai_embed_connection(
         });
     }
     let url = format!("{}/embeddings", base);
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
-        .build()
-        .map_err(err)?;
     let body = serde_json::json!({
         "model": model.trim(),
         "input": "screenrecall connection test",
     });
-    let mut req = client.post(&url).json(&body);
-    if !api_key.trim().is_empty() {
-        req = req.bearer_auth(api_key.trim());
+    let result = run_connection_test(reqwest::Method::POST, &url, Some(body), &api_key, 60).await?;
+    if !result.ok {
+        return Ok(result);
     }
-    let resp = req.send().await.map_err(err)?;
-    let st = resp.status();
-    let body_text = resp.text().await.unwrap_or_default();
-    if !st.is_success() {
-        let snippet: String = body_text.chars().take(200).collect();
-        return Ok(LlmConnectionTest {
-            ok: false,
-            detail: format!("POST {} → {}: {}", url, st, snippet),
-        });
-    }
-    let dim = serde_json::from_str::<serde_json::Value>(&body_text)
-        .ok()
-        .as_ref()
-        .and_then(|v| v.pointer("/data/0/embedding")?.as_array())
-        .map(|a| a.len());
-    Ok(LlmConnectionTest {
-        ok: true,
-        detail: match dim {
-            Some(n) if n > 0 => format!("POST {} → 200, embedding dim {}", url, n),
-            _ => format!(
-                "POST {} → 200 (body did not look like OpenAI embeddings JSON)",
-                url
-            ),
-        },
-    })
+    Ok(result)
 }
 
 /// Persisted chat UI (threads, session id) under the configured data directory.
@@ -678,10 +591,7 @@ pub async fn check_dependencies(state: AppStateHandle<'_>) -> CmdResult<Dependen
         }),
     }
 
-    let http = Client::builder()
-        .timeout(std::time::Duration::from_secs(20))
-        .build()
-        .map_err(err)?;
+    let http = shared.http.clone();
 
     match cfg.llm_backend {
         LlmBackend::Openai => {
@@ -1109,6 +1019,8 @@ pub struct Stats {
     pub archived_count: i64,
     /// Archived frames whose source files are still on disk (not yet past keep threshold).
     pub pending_deletion_count: i64,
+    /// Total on-disk size of archived frame files still pending deletion.
+    pub pending_deletion_disk_bytes: u64,
 }
 
 #[tauri::command]
@@ -1125,9 +1037,11 @@ pub fn get_stats(state: AppStateHandle<'_>) -> CmdResult<Stats> {
             .unwrap_or_default()
             .as_millis() as i64
             - (cfg.archive_keep_frames_days as i64 * 24 * 3600 * 1000);
-        state.store.pending_deletion_frame_count(keep_cutoff).unwrap_or(0)
+        let count = state.store.pending_deletion_frame_count(keep_cutoff).unwrap_or(0);
+        let bytes = state.store.pending_deletion_disk_bytes(keep_cutoff).unwrap_or(0);
+        (count, bytes)
     } else {
-        archived
+        (archived, 0)
     };
     Ok(Stats {
         frame_count: frames,
@@ -1136,7 +1050,8 @@ pub fn get_stats(state: AppStateHandle<'_>) -> CmdResult<Stats> {
         days_recorded,
         unarchived_count: unarchived,
         archived_count: archived,
-        pending_deletion_count: pending,
+        pending_deletion_count: pending.0,
+        pending_deletion_disk_bytes: pending.1,
     })
 }
 
@@ -1261,13 +1176,9 @@ pub async fn search(
     start_ts: Option<i64>,
     end_ts: Option<i64>,
 ) -> CmdResult<Vec<search::SearchHit>> {
-    let _ = (start_ts, end_ts); // reserved for date filtering in a follow-up
-    let http = Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
-        .build()
-        .map_err(err)?;
     let state_arc: Arc<AppState> = state.inner().clone();
-    search::search(&state_arc, &http, &query, limit, semantic)
+    let http = state_arc.http.clone();
+    search::search(&state_arc, &http, &query, limit, semantic, start_ts, end_ts)
         .await
         .map_err(err)
 }
@@ -1286,12 +1197,11 @@ pub async fn chat(
     start_ts: Option<i64>,
     end_ts: Option<i64>,
 ) -> CmdResult<()> {
-    let _ = (start_ts, end_ts);
     let state: Arc<AppState> = state.inner().clone();
     let session = session_id.clone();
 
     tauri::async_runtime::spawn(async move {
-        if let Err(err) = run_chat(app.clone(), state, &session, prompt, k).await {
+        if let Err(err) = run_chat(app.clone(), state, &session, prompt, k, start_ts, end_ts).await {
             let _ = app.emit(
                 "chat:error",
                 serde_json::json!({
@@ -1318,14 +1228,14 @@ async fn run_chat(
     session_id: &str,
     prompt: String,
     k: usize,
+    start_ts: Option<i64>,
+    end_ts: Option<i64>,
 ) -> anyhow::Result<()> {
     let started = std::time::Instant::now();
-    let http = Client::builder()
-        .timeout(std::time::Duration::from_secs(300))
-        .build()?;
+    let http = state.http.clone();
 
     // 1. Retrieve top-k relevant frames via hybrid search.
-    let hits = search::search(&state, &http, &prompt, k.max(1), true).await?;
+    let hits = search::search(&state, &http, &prompt, k.max(1), true, start_ts, end_ts).await?;
     let mut ctx: Vec<(Frame, Option<String>)> = Vec::new();
     for h in &hits {
         let text = state.store.get_ocr_text(h.frame.id).ok().flatten();
@@ -1374,20 +1284,17 @@ async fn run_chat(
 
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
     let cancel = Arc::new(Notify::new());
+    let session_owned = session_id.to_string();
 
     // Background task: poll for user cancellation and trigger the notify.
     {
         let state = state.clone();
         let cancel = cancel.clone();
-        let session_id = session_id.to_string();
+        let sid = session_owned.clone();
         tauri::async_runtime::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                let cancelled = {
-                    let set = state.cancelled_sessions.lock().await;
-                    set.contains(&session_id)
-                };
-                if cancelled {
+                if state.cancelled_sessions.lock().await.contains(&sid) {
                     cancel.notify_waiters();
                     break;
                 }
@@ -1398,77 +1305,48 @@ async fn run_chat(
     // Forwarder: relay chunks to the webview.
     {
         let app = app.clone();
-        let session_id = session_id.to_string();
+        let sid = session_owned.clone();
         tauri::async_runtime::spawn(async move {
             while let Some(delta) = rx.recv().await {
-                let _ = app.emit(
-                    "chat:delta",
-                    serde_json::json!({
-                        "session_id": session_id,
-                        "delta": delta,
-                    }),
-                );
+                let _ = app.emit("chat:delta", serde_json::json!({
+                    "session_id": sid,
+                    "delta": delta,
+                }));
             }
         });
     }
 
     const CHAT_STREAM_TIMEOUT_SECS: u64 = 300;
-    match timeout(
+    let stream_result = timeout(
         std::time::Duration::from_secs(CHAT_STREAM_TIMEOUT_SECS),
         client.chat_stream(&messages, &tx, &cancel),
-    )
-    .await
-    {
+    ).await;
+
+    // Drop tx so the forwarder exits.
+    drop(tx);
+
+    match stream_result {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
-            drop(tx);
-            perf_log::record(
-                &state,
-                "chat_error",
-                serde_json::json!({
-                    "session_id": session_id,
-                    "ms": started.elapsed().as_millis() as u64,
-                    "error": e.to_string(),
-                }),
-            );
+            perf_log::record(&state, "chat_error", serde_json::json!({
+                "session_id": session_id, "ms": started.elapsed().as_millis() as u64, "error": e.to_string(),
+            }));
             return Err(e);
         }
         Err(_) => {
             cancel.notify_waiters();
-            drop(tx);
-            perf_log::record(
-                &state,
-                "chat_timeout",
-                serde_json::json!({
-                    "session_id": session_id,
-                    "ms": started.elapsed().as_millis() as u64,
-                    "timeout_secs": CHAT_STREAM_TIMEOUT_SECS,
-                }),
-            );
-            return Err(anyhow::anyhow!(
-                "Chat timed out after {}s (no complete response from the model)",
-                CHAT_STREAM_TIMEOUT_SECS
-            ));
+            perf_log::record(&state, "chat_timeout", serde_json::json!({
+                "session_id": session_id, "ms": started.elapsed().as_millis() as u64, "timeout_secs": CHAT_STREAM_TIMEOUT_SECS,
+            }));
+            return Err(anyhow::anyhow!("Chat timed out after {}s", CHAT_STREAM_TIMEOUT_SECS));
         }
     }
 
-    // 4. Close out.
-    drop(tx);
-    let _ = app.emit(
-        "chat:done",
-        serde_json::json!({ "session_id": session_id }),
-    );
-    // Clear cancellation so a future reuse of the same session_id works.
+    let _ = app.emit("chat:done", serde_json::json!({ "session_id": session_id }));
     state.cancelled_sessions.lock().await.remove(session_id);
-    perf_log::record(
-        &state,
-        "chat_ok",
-        serde_json::json!({
-            "session_id": session_id,
-            "ms": started.elapsed().as_millis() as u64,
-            "hits": hits.len(),
-        }),
-    );
+    perf_log::record(&state, "chat_ok", serde_json::json!({
+        "session_id": session_id, "ms": started.elapsed().as_millis() as u64, "hits": hits.len(),
+    }));
     Ok(())
 }
 
@@ -1479,28 +1357,7 @@ async fn run_chat(
 #[tauri::command]
 pub fn open_data_dir(state: AppStateHandle<'_>) -> CmdResult<()> {
     let dir = state.config().data_dir;
-    #[cfg(target_os = "windows")]
-    {
-        std::process::Command::new("explorer")
-            .arg(&dir)
-            .spawn()
-            .map_err(err)?;
-    }
-    #[cfg(target_os = "macos")]
-    {
-        std::process::Command::new("open")
-            .arg(&dir)
-            .spawn()
-            .map_err(err)?;
-    }
-    #[cfg(target_os = "linux")]
-    {
-        std::process::Command::new("xdg-open")
-            .arg(&dir)
-            .spawn()
-            .map_err(err)?;
-    }
-    Ok(())
+    reveal_in_folder::reveal_dir(&dir).map_err(err)
 }
 
 /// Open the system file manager with this file selected (Windows Explorer, Finder, …).

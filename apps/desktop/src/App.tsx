@@ -20,14 +20,6 @@ import { listen } from "@tauri-apps/api/event";
 import type { DiskStatus } from "./lib/api";
 import Timeline from "./routes/Timeline";
 import SearchView from "./routes/Search";
-
-function formatBytes(bytes: number): string {
-  if (bytes === 0) return "0 B";
-  const k = 1024;
-  const sizes = ["B", "KB", "MB", "GB", "TB"];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + " " + sizes[i];
-}
 import Chat from "./routes/Chat";
 import Settings from "./routes/Settings";
 import Diagnostics from "./routes/Diagnostics";
@@ -35,6 +27,7 @@ import FirstRun from "./routes/FirstRun";
 import FrameWindow from "./routes/FrameWindow";
 import { api } from "./lib/api";
 import { cn } from "./lib/cn";
+import { formatBytes } from "./lib/format";
 
 const NAV = [
   { to: "/timeline", label: "Timeline", icon: CalendarClock },
@@ -55,9 +48,12 @@ export default function App() {
   >("ask");
   const [showClosePrompt, setShowClosePrompt] = useState(false);
   const [dontAskAgain, setDontAskAgain] = useState(false);
-  const [stats, setStats] = useState<{ frames: number; bytes: number } | null>(
-    null,
-  );
+  const [stats, setStats] = useState<{
+    frames: number;
+    bytes: number;
+    pendingDeletionCount: number;
+    pendingDeletionDiskBytes: number;
+  } | null>(null);
   const [diskStatus, setDiskStatus] = useState<DiskStatus | null>(null);
   const [navCollapsed, setNavCollapsed] = useState<boolean>(() => {
     try {
@@ -93,7 +89,12 @@ export default function App() {
     const refreshStats = async () => {
       try {
         const st = await api.getStats();
-        if (!cancelled) setStats({ frames: st.frameCount, bytes: st.diskBytes });
+        if (!cancelled) setStats({
+          frames: st.frameCount,
+          bytes: st.diskBytes,
+          pendingDeletionCount: st.pendingDeletionCount,
+          pendingDeletionDiskBytes: st.pendingDeletionDiskBytes,
+        });
       } catch {}
     };
     const refreshDisk = async () => {
@@ -333,6 +334,9 @@ export default function App() {
                 ) : (
                   <>
                     {stats.frames.toLocaleString()} frames · {formatBytes(stats.bytes)}
+                    {stats.pendingDeletionCount > 0 && (
+                      <> · +{formatBytes(stats.pendingDeletionDiskBytes)} pending delete</>
+                    )}
                   </>
                 )
               ) : (

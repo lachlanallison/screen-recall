@@ -11,6 +11,11 @@ use serde::Serialize;
 
 use crate::worker_activity::StageTimingStats;
 
+fn summarize_deque(samples: &VecDeque<u64>) -> StageTimingStats {
+    let v: Vec<u64> = samples.iter().copied().collect();
+    crate::worker_activity::summarize_ms(&v)
+}
+
 const PER_MONITOR_WINDOW: usize = 120;
 const OVERALL_WINDOW: usize = 240;
 
@@ -39,10 +44,10 @@ impl PhaseSamples {
     fn summarize(&self) -> PerPhaseStats {
         PerPhaseStats {
             sample_count: self.total.len(),
-            capture: summarize_ms(&self.capture),
-            downscale: summarize_ms(&self.downscale),
-            save: summarize_ms(&self.save),
-            total: summarize_ms(&self.total),
+            capture: summarize_deque(&self.capture),
+            downscale: summarize_deque(&self.downscale),
+            save: summarize_deque(&self.save),
+            total: summarize_deque(&self.total),
         }
     }
 }
@@ -107,42 +112,50 @@ impl CapturePerf {
         monitor_id: i32,
         monitor_name: &str,
         capture_ms: u64,
-        _hash_ms: u64,
         downscale_ms: u64,
         save_ms: u64,
         total_ms: u64,
     ) {
-        if let Ok(mut g) = self.by_monitor.lock() {
-            g.entry(monitor_id)
-                .or_default()
-                .push(capture_ms, downscale_ms, save_ms, total_ms);
-        }
-        if let Ok(mut g) = self.monitor_names.lock() {
-            g.insert(monitor_id, monitor_name.to_string());
-        }
-        if let Ok(mut g) = self.overall.lock() {
-            push_capped(&mut g.capture, capture_ms, OVERALL_WINDOW);
-            push_capped(&mut g.downscale, downscale_ms, OVERALL_WINDOW);
-            push_capped(&mut g.save, save_ms, OVERALL_WINDOW);
-            push_capped(&mut g.total, total_ms, OVERALL_WINDOW);
-        }
+        self.store_sample(&self.by_monitor, &self.overall, monitor_id, monitor_name, capture_ms, downscale_ms, save_ms, total_ms);
     }
 
     pub fn record_saved(
         &self,
         monitor_id: i32,
         capture_ms: u64,
-        _hash_ms: u64,
         downscale_ms: u64,
         save_ms: u64,
         total_ms: u64,
     ) {
-        if let Ok(mut g) = self.saved_by_monitor.lock() {
+        self.store_sample(&self.saved_by_monitor, &self.saved_overall, monitor_id, "", capture_ms, downscale_ms, save_ms, total_ms);
+        if let Ok(mut g) = self.monitor_names.lock() {
+            // ensure name is populated even for saved-only paths
+            g.entry(monitor_id).or_insert_with(|| format!("Monitor {monitor_id}"));
+        }
+    }
+
+    fn store_sample(
+        &self,
+        by_monitor: &Mutex<HashMap<i32, PhaseSamples>>,
+        overall: &Mutex<PhaseSamples>,
+        monitor_id: i32,
+        monitor_name: &str,
+        capture_ms: u64,
+        downscale_ms: u64,
+        save_ms: u64,
+        total_ms: u64,
+    ) {
+        if let Ok(mut g) = by_monitor.lock() {
             g.entry(monitor_id)
                 .or_default()
                 .push(capture_ms, downscale_ms, save_ms, total_ms);
         }
-        if let Ok(mut g) = self.saved_overall.lock() {
+        if !monitor_name.is_empty() {
+            if let Ok(mut g) = self.monitor_names.lock() {
+                g.insert(monitor_id, monitor_name.to_string());
+            }
+        }
+        if let Ok(mut g) = overall.lock() {
             push_capped(&mut g.capture, capture_ms, OVERALL_WINDOW);
             push_capped(&mut g.downscale, downscale_ms, OVERALL_WINDOW);
             push_capped(&mut g.save, save_ms, OVERALL_WINDOW);
@@ -225,31 +238,4 @@ fn push_capped(deque: &mut VecDeque<u64>, value: u64, cap: usize) {
         deque.pop_front();
     }
     deque.push_back(value);
-}
-
-fn summarize_ms(samples: &VecDeque<u64>) -> StageTimingStats {
-    if samples.is_empty() {
-        return StageTimingStats::default();
-    }
-    let mut s: Vec<u64> = samples.iter().copied().collect();
-    s.sort_unstable();
-    let n = s.len();
-    let sum: u64 = s.iter().sum();
-    let mean = sum as f64 / n as f64;
-    let p50 = if n % 2 == 1 {
-        s[n / 2]
-    } else {
-        (s[n / 2 - 1] + s[n / 2]) / 2
-    };
-    let p95_i = ((n as f64 * 0.95).ceil() as usize)
-        .saturating_sub(1)
-        .min(n - 1);
-    StageTimingStats {
-        sample_count: n,
-        min_ms: Some(s[0]),
-        max_ms: Some(s[n - 1]),
-        mean_ms: Some(mean),
-        p50_ms: Some(p50),
-        p95_ms: Some(s[p95_i]),
-    }
 }

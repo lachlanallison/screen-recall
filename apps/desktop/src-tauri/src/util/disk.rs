@@ -58,3 +58,14 @@ pub fn free_space_pct(path: &Path) -> Option<f64> {
     }
     Some((free as f64 / total as f64) * 100.0)
 }
+
+/// Sum the on-disk sizes of a list of file paths. Missing files contribute 0.
+pub fn sum_file_sizes(paths: &[String]) -> u64 {
+    let mut total = 0u64;
+    for p in paths {
+        if let Ok(m) = std::fs::metadata(p) {
+            total += m.len();
+        }
+    }
+    total
+}

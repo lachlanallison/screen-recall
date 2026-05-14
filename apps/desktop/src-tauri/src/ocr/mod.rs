@@ -18,6 +18,7 @@ use crate::config::OcrEngineKind;
 use crate::state::SharedState;
 use crate::util::perf_log;
 use crate::util::process::configure_hidden_std;
+use crate::util::tesseract;
 use crate::worker_activity::OcrActiveGuard;
 
 pub trait OcrEngine: Send + Sync {
@@ -61,7 +62,7 @@ fn tesseract_read_path(src: &Path) -> Result<(PathBuf, bool, (u32, u32))> {
 
 impl OcrEngine for TesseractEngine {
     fn ocr_image(&self, path: &Path) -> Result<String> {
-        let bin = resolve_tesseract_binary().ok_or_else(|| {
+        let bin = tesseract::find_binary().ok_or_else(|| {
             anyhow::anyhow!(
                 "tesseract executable not found. Install Tesseract and ensure it is on PATH."
             )
@@ -122,36 +123,9 @@ impl OcrEngine for TesseractEngine {
     }
 }
 
-fn resolve_tesseract_binary() -> Option<std::path::PathBuf> {
-    let candidates = [
-        std::path::PathBuf::from("tesseract.exe"),
-        std::path::PathBuf::from("tesseract"),
-        std::path::PathBuf::from(r"C:\Program Files\Tesseract-OCR\tesseract.exe"),
-        std::path::PathBuf::from(r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe"),
-    ];
-
-    for c in candidates {
-        let mut cmd = Command::new(&c);
-        configure_hidden_std(&mut cmd);
-        let ok = cmd
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        if ok {
-            return Some(c);
-        }
-    }
-
-    None
-}
-
 fn build_engine(kind: OcrEngineKind) -> Box<dyn OcrEngine> {
     match kind {
         OcrEngineKind::Tesseract => Box::new(TesseractEngine),
-        // TODO: wire platform-native (Windows.Media.Ocr / Apple Vision)
-        // and vision-LLM engines. For now they fall back to Tesseract.
-        OcrEngineKind::Native | OcrEngineKind::Vision => Box::new(TesseractEngine),
     }
 }
 

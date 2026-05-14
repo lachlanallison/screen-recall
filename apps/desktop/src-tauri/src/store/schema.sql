@@ -11,7 +11,8 @@ CREATE TABLE IF NOT EXISTS frames (
     embed_done         INTEGER NOT NULL DEFAULT 0,
     static_until_ms    INTEGER NOT NULL,        -- last tick this still matched (>= ts); dedupe extends this
     video_path         TEXT,                    -- path to archived video segment (null = still on disk as frame file)
-    video_offset_ms    INTEGER                  -- ms offset into video_path where this frame lives (null if not archived)
+    video_offset_ms    INTEGER,                 -- ms offset into video_path where this frame lives (null if not archived)
+    archived_at        INTEGER                  -- unix ms when this frame was archived to video (null = not archived)
 );
 CREATE INDEX IF NOT EXISTS idx_frames_ts ON frames(ts);
 CREATE INDEX IF NOT EXISTS idx_frames_monitor_id ON frames(monitor_id, id);

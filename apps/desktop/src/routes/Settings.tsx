@@ -11,18 +11,6 @@ import {
   type ManagedLlamaStatus,
 } from "../lib/api";
 
-const KNOWN_ENCODER_OPTIONS: Omit<EncoderPreset, "compressionRatio">[] = [
-  { id: "h264", label: "H.264 (software)", ffmpegEncoder: "libx264", description: "Universal compatibility, fast encode", hardwareOnly: false },
-  { id: "h264_qsv", label: "H.264 (Intel QSV)", ffmpegEncoder: "h264_qsv", description: "Intel hardware encode, very fast", hardwareOnly: true },
-  { id: "h264_nvenc", label: "H.264 (NVIDIA NVENC)", ffmpegEncoder: "h264_nvenc", description: "NVIDIA hardware encode, very fast", hardwareOnly: true },
-  { id: "h265", label: "H.265/HEVC (software)", ffmpegEncoder: "libx265", description: "40-50% smaller than H.264, slower encode", hardwareOnly: false },
-  { id: "h265_qsv", label: "H.265/HEVC (Intel QSV)", ffmpegEncoder: "hevc_qsv", description: "Intel hardware HEVC encode", hardwareOnly: true },
-  { id: "h265_nvenc", label: "H.265/HEVC (NVIDIA NVENC)", ffmpegEncoder: "hevc_nvenc", description: "NVIDIA hardware HEVC encode", hardwareOnly: true },
-  { id: "av1_qsv", label: "AV1 (Intel QSV)", ffmpegEncoder: "av1_qsv", description: "Intel Arc hardware AV1, smallest files", hardwareOnly: true },
-  { id: "av1_nvenc", label: "AV1 (NVIDIA NVENC)", ffmpegEncoder: "av1_nvenc", description: "NVIDIA hardware AV1 encode", hardwareOnly: true },
-  { id: "vp9", label: "VP9 (software)", ffmpegEncoder: "libvpx-vp9", description: "Google's open codec, good compression", hardwareOnly: false },
-];
-
 export default function Settings() {
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [saving, setSaving] = useState(false);
@@ -50,6 +38,7 @@ export default function Settings() {
   const [ffmpegInstallMsg, setFfmpegInstallMsg] = useState<string | null>(null);
   const [transcodeBusy, setTranscodeBusy] = useState(false);
   const [transcodeProgress, setTranscodeProgress] = useState<{ current: number; total: number; file: string } | null>(null);
+  const [knownEncoders, setKnownEncoders] = useState<EncoderPreset[]>([]);
 
   useEffect(() => {
     api
@@ -128,6 +117,12 @@ export default function Settings() {
 
   useEffect(() => {
     let mounted = true;
+    void api
+      .getKnownEncoders()
+      .then((e) => {
+        if (mounted) setKnownEncoders(e);
+      })
+      .catch(() => {});
     void api
       .refreshEncoderAvailability()
       .then((e) => {
@@ -513,6 +508,28 @@ export default function Settings() {
                 </p>
               </Field>
             )}
+            <Field label="Resize filter (affects OCR quality vs speed)">
+              <div className="flex flex-wrap gap-2">
+                {(["nearest", "lanczos3"] as const).map((f) => (
+                  <button
+                    key={f}
+                    type="button"
+                    onClick={() => patch({ capture_resize_filter: f })}
+                    className={
+                      "rounded-md border px-3 py-1.5 text-xs " +
+                      (config.capture_resize_filter === f
+                        ? "border-accent bg-accent/10 text-accent"
+                        : "border-border text-text-muted hover:text-text")
+                    }
+                  >
+                    {f === "nearest" ? "Nearest (fast)" : "Lanczos3 (sharper)"}
+                  </button>
+                ))}
+              </div>
+              <p className="mt-1 text-[11px] text-text-faint">
+                Nearest is fastest. Lanczos3 produces sharper text for better OCR but is ~5× slower.
+              </p>
+            </Field>
             <Field label="Retention (days, 0 = forever)">
               <input
                 type="number"
@@ -1033,7 +1050,7 @@ export default function Settings() {
           <Section title="OCR">
             <Field label="Engine">
               <div className="flex flex-wrap gap-2">
-                {(["tesseract", "native", "vision"] as const).map((o) => (
+                {(["tesseract"] as const).map((o) => (
                   <button
                     key={o}
                     onClick={() => patch({ ocr_engine: o })}
@@ -1044,11 +1061,7 @@ export default function Settings() {
                         : "border-border text-text-muted hover:text-text")
                     }
                   >
-                    {o === "tesseract"
-                      ? "Tesseract"
-                      : o === "native"
-                        ? "Platform native"
-                        : "Vision LLM"}
+                    Tesseract
                   </button>
                 ))}
               </div>
@@ -1108,11 +1121,14 @@ export default function Settings() {
                   {archiver.running ? (
                     <span className="text-sky-400">Encoding…</span>
                   ) : (
-                    <span className="text-green-400">Idle (waiting for next interval)</span>
+                    <span className="text-green-400">Idle</span>
                   )}
                   {" · "}
                   {(archiver.totalArchived ?? 0).toLocaleString()} frames archived ·{" "}
                   {(archiver.totalSegments ?? 0).toLocaleString()} segments
+                  {archiver.nextRunTs && !archiver.running && (
+                    <> · next run ~{new Date(archiver.nextRunTs).toLocaleTimeString()}</>
+                  )}
                 </div>
               )}
               {archiver?.lastError && (
@@ -1196,7 +1212,7 @@ export default function Settings() {
                       onChange={(e) => patch({ archive_codec: e.target.value })}
                       className="input"
                     >
-                      {KNOWN_ENCODER_OPTIONS.map((opt) => {
+                      {knownEncoders.map((opt) => {
                         const available = encoders?.availableEncoders?.includes(opt.ffmpegEncoder) ?? false;
                         const isRecommended = encoders?.recommended === opt.id;
                         return (
@@ -1216,7 +1232,7 @@ export default function Settings() {
                       {encoders.ffmpegVersion} ·{" "}
                       {(encoders.availableEncoders?.length ?? 0)} encoders detected
                     </p>
-                    {KNOWN_ENCODER_OPTIONS.some((o) => o.hardwareOnly && !encoders?.availableEncoders?.includes(o.ffmpegEncoder)) && (
+                    {knownEncoders.some((o) => o.hardwareOnly && !encoders?.availableEncoders?.includes(o.ffmpegEncoder)) && (
                       <p className="text-[10px] text-text-faint">
                         Hardware encoders (QSV/NVENC) not detected. Your FFmpeg build may lack oneVPL/CUDA support.
                         For Intel Arc, install a build with <code className="font-mono">--enable-libvpl</code> (e.g.{" "}
@@ -1358,7 +1374,7 @@ export default function Settings() {
                   className="input text-xs"
                   disabled={transcodeBusy}
                 >
-                  {KNOWN_ENCODER_OPTIONS.map((opt) => {
+                  {knownEncoders.map((opt) => {
                     const available = encoders?.availableEncoders?.includes(opt.ffmpegEncoder) ?? false;
                     return (
                       <option

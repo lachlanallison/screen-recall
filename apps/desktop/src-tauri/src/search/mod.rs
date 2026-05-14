@@ -25,9 +25,11 @@ pub async fn search(
     query: &str,
     limit: usize,
     semantic: bool,
+    start_ts: Option<i64>,
+    end_ts: Option<i64>,
 ) -> Result<Vec<SearchHit>> {
     let started = std::time::Instant::now();
-    let fts = state.store.fts_search(&fts_query(query), limit as i64)?;
+    let fts = state.store.fts_search_range(&fts_query(query), limit as i64, start_ts, end_ts)?;
 
     if !semantic {
         perf_log::record(
@@ -59,7 +61,7 @@ pub async fn search(
         Ok(qvec) => {
             let sem = state
                 .store
-                .semantic_search(&qvec, limit)
+                .semantic_search_range(&qvec, limit, start_ts, end_ts)
                 .unwrap_or_default();
             perf_log::record(
                 state,
