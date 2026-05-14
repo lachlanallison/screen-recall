@@ -1,6 +1,6 @@
 [package]
 name = "screenrecall"
-version = "0.1.0"
+version = "0.2.0"
 description = "Private, local-first screen recall (ScreenRecall)"
 authors = ["ScreenRecall contributors"]
 edition = "2021"
@@ -43,6 +43,7 @@ uuid = { version = "1", features = ["v4"] }
 # Screen capture + images
 xcap = "0.9"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+jpeg-encoder = "0.6"
 
 # HTTP (Ollama / OpenAI)
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
@@ -71,7 +72,21 @@ windows = { version = "0.61", features = [
   "Win32_System_LibraryLoader",
   "Win32_System_RemoteDesktop",
   "Win32_UI_WindowsAndMessaging",
+  "Win32_Devices_Display",
+  "Win32_Storage_FileSystem",
 ] }
+
+[target.'cfg(not(windows))'.dependencies]
+libc = "0.2"
+
+# Optimize heavy compute dependencies even in dev — these are 10–100× slower
+# without compiler optimizations, making the app feel broken during development.
+[profile.dev.package.xcap]
+opt-level = 3
+[profile.dev.package.image]
+opt-level = 3
+[profile.dev.package.jpeg-encoder]
+opt-level = 3
 
 [features]
 default = ["custom-protocol"]

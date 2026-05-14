@@ -18,7 +18,7 @@ Nothing leaves your machine unless you point it at a remote LLM yourself.
 
 ## Features
 
-- **Cross-platform capture** via [`xcap`](https://crates.io/crates/xcap) (Windows, macOS, Linux X11).
+- **Cross-platform capture** via `[xcap](https://crates.io/crates/xcap)` (Windows, macOS, Linux X11).
 - **Smart diffing**: perceptual hash (dHash) skips unchanged frames so idle time costs little.
 - **Private storage**: WebP frames under `~/.screenrecall/frames/` and SQLite (`~/.screenrecall/screenrecall.db`) with FTS5 + embeddings.
 - **Pluggable OCR**: Tesseract by default; other engines available in Settings.
@@ -50,14 +50,14 @@ flags (`-SkipModels`, `-SkipBuildTools`, `-Tesseract`, `-Ollama`).
 
 ## Manual requirements
 
-- **Rust** (stable, 1.77+): https://rustup.rs  
+- **Rust** (stable, 1.77+): [https://rustup.rs](https://rustup.rs)  
 - **Node 20+** and **pnpm 9+**  
-- **Tauri 2 prerequisites**: https://v2.tauri.app/start/prerequisites/  
+- **Tauri 2 prerequisites**: [https://v2.tauri.app/start/prerequisites/](https://v2.tauri.app/start/prerequisites/)  
 - **Tesseract**: needed for the default offline OCR path (install via your OS
-  or the Windows setup script prompt). Choose another OCR engine in Settings if
-  you prefer.  
+or the Windows setup script prompt). Choose another OCR engine in Settings if
+you prefer.  
 - **Ollama** (or another OpenAI-compatible host): optional if you route chat
-  / embeddings through a remote or alternate local API instead of Ollama.  
+/ embeddings through a remote or alternate local API instead of Ollama.
 
 If you use Ollama locally, typical default models (adjust in Settings):
 
@@ -94,22 +94,22 @@ screen-recall/
 
 - Capture, OCR, embedding, and retrieval run locally by default.  
 - Remote LLM endpoints receive only what you send (queries + retrieved OCR snippets).  
-- Data lives under **`~/.screenrecall`** unless you change **Data directory** in Settings. Delete that folder to wipe local history.
+- Data lives under `**~/.screenrecall**` unless you change **Data directory** in Settings. Delete that folder to wipe local history.
 
 ---
 
 ## Contributing
 
-See [`CONTRIBUTING.md`](CONTRIBUTING.md).
+See `[CONTRIBUTING.md](CONTRIBUTING.md)`.
 
 ---
 
 ## Security
 
-See [`SECURITY.md`](SECURITY.md).
+See `[SECURITY.md](SECURITY.md)`.
 
 ---
 
 ## License
 
-MIT. See [`LICENSE`](LICENSE).
+MIT. See `[LICENSE](LICENSE)`.

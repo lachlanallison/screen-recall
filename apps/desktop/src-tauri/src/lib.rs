@@ -4,7 +4,9 @@
 //! It wires up Tauri, the SQLite store, the capture / OCR / embedding
 //! workers, the tray menu and the command surface.
 
+mod archive;
 mod capture;
+mod capture_perf;
 mod config;
 mod embed;
 mod llm;
@@ -20,12 +22,13 @@ use util::workstation_lock;
 pub mod commands;
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use tauri::{
     menu::{Menu, MenuEvent, MenuItem},
     tray::{MouseButton, TrayIconBuilder, TrayIconEvent},
-    Manager, RunEvent,
+    Emitter, Manager, RunEvent,
 };
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -59,29 +62,120 @@ pub fn run() {
             let state = Arc::new(state);
             app.manage(state.clone());
 
-            // Background refresh of on-disk frames size so UI `get_stats` stays non-blocking.
+            // Background refresh of on-disk stats so UI stays non-blocking.
             {
                 let state = state.clone();
                 tauri::async_runtime::spawn(async move {
-                    loop {
+                    async fn refresh_stats(state: &Arc<AppState>) {
                         let frames_dir = state.frames_dir();
-                        let mb = tokio::task::spawn_blocking(move || dir_size_mb(&frames_dir))
+                        let bytes = tokio::task::spawn_blocking({
+                            let p = frames_dir.clone();
+                            move || dir_size_bytes(&p)
+                        })
                             .await
-                            .unwrap_or(0.0);
-                        state.set_cached_disk_mb(mb);
+                            .unwrap_or(0);
+                        state.set_cached_disk_bytes(bytes);
                         if let Ok((frames, indexed)) = state.store.stats() {
                             state.set_cached_counts(frames, indexed);
                         }
+                        if let Ok(archived) = state.store.archived_frame_count() {
+                            state.set_cached_archived_count(archived);
+                        }
+                        if let Ok(unarchived) = state.store.unarchived_frame_disk_bytes() {
+                            state.set_cached_unarchived_bytes(unarchived);
+                        }
+                        if let Ok(unarchived_count) = state.store.unarchived_frame_count() {
+                            state.set_cached_unarchived_count(unarchived_count);
+                        }
+                    }
+
+                    // Run once immediately so stats aren't 0 on first paint.
+                    refresh_stats(&state).await;
+
+                    loop {
                         tokio::time::sleep(Duration::from_secs(60)).await;
+                        refresh_stats(&state).await;
+                    }
+                });
+            }
+
+            // Background disk-space monitor: warn at <10%, stop recording at <5%.
+            {
+                let state = state.clone();
+                let app = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    use std::sync::atomic::AtomicBool;
+                    let warned: AtomicBool = AtomicBool::new(false);
+
+                    async fn check_disk(
+                        state: &Arc<AppState>,
+                        app: &tauri::AppHandle,
+                        warned: &AtomicBool,
+                    ) {
+                        let data_dir = state.config().data_dir.clone();
+                        let pct = tokio::task::spawn_blocking(move || {
+                            crate::util::disk::free_space_pct(&data_dir)
+                        })
+                        .await
+                        .unwrap_or(None);
+
+                        if let Some(pct) = pct {
+                            let warning = pct < 10.0;
+                            let stopped = pct < 5.0;
+                            let was_stopped = state.disk_stopped();
+                            let was_warning = state.disk_warning();
+                            state.set_disk_status(warning, stopped, pct);
+
+                            if stopped && !was_stopped {
+                                state.set_recording(false);
+                                warn!(free_pct = pct, "disk critically low — recording paused");
+                                let _ = app.emit(
+                                    "screenrecall:disk-status",
+                                    serde_json::json!({
+                                        "warning": true,
+                                        "stopped": true,
+                                        "freePct": pct,
+                                    }),
+                                );
+                            } else if warning && !was_warning && !stopped {
+                                if !warned.load(Ordering::Relaxed) {
+                                    warned.store(true, Ordering::Relaxed);
+                                    warn!(free_pct = pct, "disk space low — warning issued");
+                                    let _ = app.emit(
+                                        "screenrecall:disk-status",
+                                        serde_json::json!({
+                                            "warning": true,
+                                            "stopped": false,
+                                            "freePct": pct,
+                                        }),
+                                    );
+                                }
+                            } else if !warning && !stopped {
+                                warned.store(false, Ordering::Relaxed);
+                            }
+                        }
+                    }
+
+                    check_disk(&state, &app, &warned).await;
+
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(60)).await;
+                        check_disk(&state, &app, &warned).await;
                     }
                 });
             }
 
             // Optional managed local llama.cpp auto-start (chat/embed).
+            // Only start when the backend is OpenAI-compatible; Ollama backend uses the
+            // system Ollama service instead of managed llama-server processes.
             {
                 let state = state.clone();
                 tauri::async_runtime::spawn(async move {
                     let cfg = state.config();
+                    let use_managed = matches!(cfg.llm_backend, config::LlmBackend::Openai);
+                    if !use_managed {
+                        return;
+                    }
                     let cwd = cfg.managed_server_working_dir.clone();
                     if cfg.managed_chat_server_autostart {
                         if let Some(cmd) = cfg.managed_chat_server_command.filter(|s| !s.trim().is_empty()) {
@@ -252,9 +346,17 @@ pub fn run() {
                         }
                     }
                 });
+                tauri::async_runtime::spawn({
+                    let state = state.clone();
+                    async move {
+                        if let Err(err) = archive::run_worker(state).await {
+                            warn!(?err, "archiver worker exited");
+                        }
+                    }
+                });
             }
 
-            info!("ScreenRecall initialized; capture + OCR + embedding workers running");
+            info!("ScreenRecall initialized; capture + OCR + embedding + archiver workers running");
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -275,11 +377,20 @@ pub fn run() {
             commands::check_dependencies,
             commands::install_tesseract,
             commands::install_ollama,
+            commands::install_ffmpeg,
+            commands::ensure_ffmpeg_path,
             commands::pull_model,
             commands::complete_setup,
             commands::get_stats,
             commands::get_health_snapshot,
             commands::get_worker_queue_snapshot,
+            commands::get_capture_perf,
+            commands::get_disk_status,
+            commands::get_encoder_availability,
+            commands::refresh_encoder_availability,
+            commands::get_archiver_status,
+            commands::archive_history_now,
+            commands::transcode_archives,
             commands::list_frames,
             commands::get_frame_ocr,
             commands::get_frame_embedding_preview,
@@ -293,6 +404,7 @@ pub fn run() {
             commands::delete_all,
             commands::window_minimize_to_tray,
             commands::window_quit_app,
+            commands::restart_app,
             commands::get_perf_log_tail,
             commands::get_perf_log_path,
             commands::get_runtime_log_tail,
@@ -328,7 +440,7 @@ async fn fanout(
     }
 }
 
-fn dir_size_mb(path: &std::path::Path) -> f64 {
+fn dir_size_bytes(path: &std::path::Path) -> u64 {
     let mut total = 0u64;
     let mut stack = vec![path.to_path_buf()];
     while let Some(p) = stack.pop() {
@@ -345,5 +457,5 @@ fn dir_size_mb(path: &std::path::Path) -> f64 {
             }
         }
     }
-    total as f64 / 1_048_576.0
+    total
 }

@@ -16,8 +16,18 @@ import {
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { listen } from "@tauri-apps/api/event";
+import type { DiskStatus } from "./lib/api";
 import Timeline from "./routes/Timeline";
 import SearchView from "./routes/Search";
+
+function formatBytes(bytes: number): string {
+  if (bytes === 0) return "0 B";
+  const k = 1024;
+  const sizes = ["B", "KB", "MB", "GB", "TB"];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + " " + sizes[i];
+}
 import Chat from "./routes/Chat";
 import Settings from "./routes/Settings";
 import Diagnostics from "./routes/Diagnostics";
@@ -45,9 +55,10 @@ export default function App() {
   >("ask");
   const [showClosePrompt, setShowClosePrompt] = useState(false);
   const [dontAskAgain, setDontAskAgain] = useState(false);
-  const [stats, setStats] = useState<{ frames: number; mb: number } | null>(
+  const [stats, setStats] = useState<{ frames: number; bytes: number } | null>(
     null,
   );
+  const [diskStatus, setDiskStatus] = useState<DiskStatus | null>(null);
   const [navCollapsed, setNavCollapsed] = useState<boolean>(() => {
     try {
       return localStorage.getItem(NAV_COLLAPSED_KEY) === "1";
@@ -82,19 +93,36 @@ export default function App() {
     const refreshStats = async () => {
       try {
         const st = await api.getStats();
-        if (!cancelled) setStats({ frames: st.frame_count, mb: st.disk_mb });
+        if (!cancelled) setStats({ frames: st.frameCount, bytes: st.diskBytes });
       } catch {}
     };
+    const refreshDisk = async () => {
+      try {
+        const d = await api.getDiskStatus();
+        if (!cancelled) setDiskStatus(d);
+      } catch {}
+    };
+
     bootstrap();
     refreshStatus();
     refreshStats();
+    refreshDisk();
     const statusId = setInterval(refreshStatus, 5000);
-    // `getStats` computes on-disk size (walks files); keep it infrequent to avoid UI jank.
-    const statsId = setInterval(refreshStats, 60000);
+
+    // Poll stats every 2s. Once cached, this is instant (just reads atomic values).
+    const statsId = setInterval(refreshStats, 2000);
+    const diskId = setInterval(refreshDisk, 10000);
+
+    const unlisten = listen<DiskStatus>("screenrecall:disk-status", (ev) => {
+      if (!cancelled) setDiskStatus(ev.payload);
+    });
+
     return () => {
       cancelled = true;
       clearInterval(statusId);
       clearInterval(statsId);
+      clearInterval(diskId);
+      unlisten.then((f) => f());
     };
   }, []);
 
@@ -219,6 +247,16 @@ export default function App() {
 
   return (
     <div className="flex h-full w-full bg-bg text-text">
+      {diskStatus?.stopped && (
+        <div className="absolute inset-x-0 top-0 z-50 flex h-8 items-center justify-center bg-red-600 text-xs font-medium text-white">
+          Recording stopped — disk critically low ({diskStatus.freePct.toFixed(1)}% free)
+        </div>
+      )}
+      {diskStatus?.warning && !diskStatus.stopped && (
+        <div className="absolute inset-x-0 top-0 z-50 flex h-8 items-center justify-center bg-amber-500 text-xs font-medium text-black">
+          Warning — disk space low ({diskStatus.freePct.toFixed(1)}% free)
+        </div>
+      )}
       {setupReady && (
         <aside
           className={
@@ -289,7 +327,17 @@ export default function App() {
           </button>
           {!navCollapsed && stats && (
             <div className="text-xs text-text-faint">
-              {stats.frames.toLocaleString()} frames · {stats.mb.toFixed(1)} MB
+              {stats ? (
+                stats.bytes === 0 && stats.frames === 0 ? (
+                  <span className="text-text-faint">Calculating disk usage…</span>
+                ) : (
+                  <>
+                    {stats.frames.toLocaleString()} frames · {formatBytes(stats.bytes)}
+                  </>
+                )
+              ) : (
+                <span className="text-text-faint">Loading…</span>
+              )}
             </div>
           )}
         </div>

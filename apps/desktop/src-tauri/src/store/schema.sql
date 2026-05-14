@@ -2,14 +2,16 @@
 CREATE TABLE IF NOT EXISTS frames (
     id                 INTEGER PRIMARY KEY AUTOINCREMENT,
     ts                 INTEGER NOT NULL,        -- unix milliseconds (first capture of this visual)
-    path               TEXT    NOT NULL,        -- absolute path on disk
+    path               TEXT    NOT NULL,        -- absolute path on disk (original frame or video path)
     phash              INTEGER NOT NULL,        -- 64-bit perceptual hash
     app                TEXT,                    -- active process name
     window_title       TEXT,                    -- active window title
     monitor_id         INTEGER NOT NULL,
     ocr_done           INTEGER NOT NULL DEFAULT 0,
     embed_done         INTEGER NOT NULL DEFAULT 0,
-    static_until_ms    INTEGER NOT NULL         -- last tick this still matched (>= ts); dedupe extends this
+    static_until_ms    INTEGER NOT NULL,        -- last tick this still matched (>= ts); dedupe extends this
+    video_path         TEXT,                    -- path to archived video segment (null = still on disk as frame file)
+    video_offset_ms    INTEGER                  -- ms offset into video_path where this frame lives (null if not archived)
 );
 CREATE INDEX IF NOT EXISTS idx_frames_ts ON frames(ts);
 CREATE INDEX IF NOT EXISTS idx_frames_monitor_id ON frames(monitor_id, id);

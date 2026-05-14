@@ -1,11 +1,37 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { format } from "date-fns";
-import { Copy, Expand, ExternalLink, FolderOpen, X } from "lucide-react";
+import { Copy, Expand, ExternalLink, FolderOpen, X, Film, Image as ImageIcon } from "lucide-react";
 import { api, type EmbeddingPreview, type Frame } from "../lib/api";
 import { openFrameWindow } from "../lib/frameWindow";
 import { staticHeldLabel } from "../lib/staticHeld";
 
 const PAGE_SIZE = 120;
+
+/** A group of frames that share the same video_path (archived segment) or a single still frame. */
+type TimelineItem =
+  | { type: "video"; videoPath: string; frames: Frame[] }
+  | { type: "still"; frame: Frame };
+
+function buildTimelineItems(frames: Frame[]): TimelineItem[] {
+  const items: TimelineItem[] = [];
+  let i = 0;
+  while (i < frames.length) {
+    const f = frames[i];
+    if (f.video_path) {
+      // Collect all consecutive frames with the same video_path.
+      const group: Frame[] = [f];
+      while (i + 1 < frames.length && frames[i + 1].video_path === f.video_path) {
+        i++;
+        group.push(frames[i]);
+      }
+      items.push({ type: "video", videoPath: f.video_path, frames: group });
+    } else {
+      items.push({ type: "still", frame: f });
+    }
+    i++;
+  }
+  return items;
+}
 
 export default function Timeline() {
   const [frames, setFrames] = useState<Frame[]>([]);
@@ -29,6 +55,10 @@ export default function Timeline() {
   const [embedFilter, setEmbedFilter] = useState<
     "any" | "vector" | "na" | "pending"
   >("any");
+
+  // State for video frame extraction
+  const [frozenFrameUrl, setFrozenFrameUrl] = useState<string | null>(null);
+  const [activeFrame, setActiveFrame] = useState<Frame | null>(null);
 
   const refreshFrames = useCallback(async () => {
     try {
@@ -127,7 +157,13 @@ export default function Timeline() {
     if (!selected) {
       setOcrText(null);
       setEmbedPreview(null);
+      setActiveFrame(null);
+      setFrozenFrameUrl(null);
       return;
+    }
+    // Reset freeze state when selection changes
+    if (activeFrame?.id !== selected.id && !frozenFrameUrl) {
+      setActiveFrame(selected);
     }
     let cancelled = false;
     setOcrLoading(true);
@@ -161,10 +197,102 @@ export default function Timeline() {
     };
   }, [selected?.id]);
 
-  const grouped = groupByDay(filteredFrames);
-  const selectedHeld = selected
-    ? staticHeldLabel(selected.static_until_ms, selected.ts)
+  // Load details for active frame (when frozen or scrubbed)
+  useEffect(() => {
+    if (!activeFrame || activeFrame.id === selected?.id) return;
+    let cancelled = false;
+    setOcrLoading(true);
+    setEmbedLoading(true);
+    setOcrText(null);
+    setEmbedPreview(null);
+    void Promise.all([
+      api.getFrameOcr(activeFrame.id),
+      api.getFrameEmbeddingPreview(activeFrame.id),
+    ])
+      .then(([t, emb]) => {
+        if (cancelled) return;
+        setOcrText(t);
+        setEmbedPreview(emb);
+      })
+      .catch((e) => {
+        if (!cancelled) {
+          console.error("active frame detail load failed", e);
+          setOcrText(null);
+          setEmbedPreview(null);
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setOcrLoading(false);
+          setEmbedLoading(false);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeFrame?.id]);
+
+  const displayFrame = activeFrame ?? selected;
+  const selectedHeld = displayFrame
+    ? staticHeldLabel(displayFrame.static_until_ms, displayFrame.ts)
     : null;
+
+  const handleFreezeFrame = (video: HTMLVideoElement) => {
+    video.pause();
+    const canvas = document.createElement("canvas");
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    const ctx = canvas.getContext("2d");
+    if (!ctx || !displayFrame) return;
+    ctx.drawImage(video, 0, 0);
+    canvas.toBlob((blob) => {
+      if (!blob) return;
+      const url = URL.createObjectURL(blob);
+      setFrozenFrameUrl(url);
+      // Find closest frame
+      const currentMs = video.currentTime * 1000;
+      if (displayFrame.video_path) {
+        const segmentFrames = filteredFrames.filter(
+          (f) => f.video_path === displayFrame.video_path
+        );
+        let closest = segmentFrames[0];
+        let minDiff = Infinity;
+        for (const f of segmentFrames) {
+          if (f.video_offset_ms == null) continue;
+          const diff = Math.abs(f.video_offset_ms - currentMs);
+          if (diff < minDiff) {
+            minDiff = diff;
+            closest = f;
+          }
+        }
+        if (closest) {
+          setActiveFrame(closest);
+        }
+      }
+    }, "image/png");
+  };
+
+  const handleResumeVideo = () => {
+    if (frozenFrameUrl) {
+      URL.revokeObjectURL(frozenFrameUrl);
+      setFrozenFrameUrl(null);
+    }
+    setActiveFrame(null);
+  };
+
+  const copyFrozenFrame = async () => {
+    if (!frozenFrameUrl) return;
+    try {
+      const res = await fetch(frozenFrameUrl);
+      const blob = await res.blob();
+      await navigator.clipboard.write([
+        new ClipboardItem({ [blob.type]: blob }),
+      ]);
+    } catch {
+      // Fallback: open in new tab
+      window.open(frozenFrameUrl, "_blank");
+    }
+  };
 
   return (
     <div className="flex h-full flex-col">
@@ -228,13 +356,30 @@ export default function Timeline() {
       ) : (
         <div className="flex flex-1 overflow-hidden">
           <div className="flex-1 overflow-y-auto scrollbar-thin p-4 space-y-6">
-            {Object.entries(grouped).map(([day, dayFrames]) => (
+            {Object.entries(groupByDay(filteredFrames)).map(([day, dayFrames]) => {
+              const dayItems = buildTimelineItems(dayFrames);
+              return (
               <section key={day} className="space-y-2">
                 <h2 className="text-xs font-semibold uppercase tracking-wider text-text-muted">
                   {day}
                 </h2>
                 <div className="grid grid-cols-[repeat(auto-fill,minmax(220px,1fr))] gap-3">
-                  {dayFrames.map((f) => {
+                  {dayItems.map((item) => {
+                    if (item.type === "video") {
+                      return (
+                        <VideoSegmentCard
+                          key={item.videoPath}
+                          item={item}
+                          selected={selected}
+                          onSelect={(f) => setSelected(f)}
+                          onContextMenu={(e, f) => {
+                            e.preventDefault();
+                            setMenu({ x: e.clientX, y: e.clientY, frame: f });
+                          }}
+                        />
+                      );
+                    }
+                    const f = item.frame;
                     const held = staticHeldLabel(f.static_until_ms, f.ts);
                     return (
                     <button
@@ -277,92 +422,154 @@ export default function Timeline() {
                   })}
                 </div>
               </section>
-            ))}
+              );
+            })}
           </div>
 
-          {selected && (
+          {displayFrame && (
             <aside className="w-96 shrink-0 border-l border-border bg-bg-elevated overflow-y-auto scrollbar-thin">
-              <button
-                type="button"
-                onClick={() => setViewer(selected)}
-                onContextMenu={(e) => {
-                  e.preventDefault();
-                  setMenu({ x: e.clientX, y: e.clientY, frame: selected });
-                }}
-                className="relative block w-full border-b border-border"
-                title="Open large preview"
-              >
-                <img
-                  src={api.assetUrl(selected.path)}
-                  alt=""
-                  decoding="async"
-                  className="w-full"
-                />
-                <span className="absolute right-2 top-2 rounded border border-border bg-bg/80 p-1 text-text-muted">
-                  <Expand className="h-3.5 w-3.5" />
-                </span>
-              </button>
+              {displayFrame.video_path ? (
+                <div className="relative block w-full border-b border-border">
+                  {frozenFrameUrl ? (
+                    <div className="relative">
+                      <img
+                        src={frozenFrameUrl}
+                        alt="Frozen frame"
+                        className="w-full"
+                      />
+                      <button
+                        type="button"
+                        onClick={handleResumeVideo}
+                        className="absolute right-2 top-2 rounded border border-border bg-bg/80 p-1 text-text-muted hover:bg-bg-hover"
+                        title="Resume video"
+                      >
+                        <Film className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="relative">
+                      <video
+                        src={api.assetUrl(displayFrame.video_path)}
+                        className="w-full"
+                        controls
+                        preload="metadata"
+                        onLoadedMetadata={(e) => {
+                          const video = e.currentTarget;
+                          if (displayFrame.video_offset_ms) {
+                            video.currentTime = displayFrame.video_offset_ms / 1000;
+                          }
+                        }}
+                      />
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          const video = (e.currentTarget.parentElement?.querySelector("video")) as HTMLVideoElement | null;
+                          if (video) handleFreezeFrame(video);
+                        }}
+                        className="absolute right-2 top-2 rounded border border-border bg-bg/80 p-1 text-text-muted hover:bg-bg-hover"
+                        title="Freeze frame at current time"
+                      >
+                        <ImageIcon className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => setViewer(displayFrame)}
+                  onContextMenu={(e) => {
+                    e.preventDefault();
+                    setMenu({ x: e.clientX, y: e.clientY, frame: displayFrame });
+                  }}
+                  className="relative block w-full border-b border-border"
+                  title="Open large preview"
+                >
+                  <img
+                    src={api.assetUrl(displayFrame.path)}
+                    alt=""
+                    decoding="async"
+                    className="w-full"
+                  />
+                  <span className="absolute right-2 top-2 rounded border border-border bg-bg/80 p-1 text-text-muted">
+                    <Expand className="h-3.5 w-3.5" />
+                  </span>
+                </button>
+              )}
               <div className="p-4 space-y-3">
                 <div>
                   <div className="text-xs text-text-muted">Frame ID</div>
-                  <div className="text-sm font-mono">#{selected.id}</div>
+                  <div className="text-sm font-mono">#{displayFrame.id}</div>
                 </div>
                 <div>
                   <div className="text-xs text-text-muted">Time</div>
                   <div className="text-sm">
-                    {format(selected.ts, "PPpp")}
+                    {format(displayFrame.ts, "PPpp")}
                     {selectedHeld && (
                       <div className="mt-0.5 text-xs text-text-muted">
                         {selectedHeld} (end{" "}
-                        {format(selected.static_until_ms ?? selected.ts, "PPpp")})
+                        {format(displayFrame.static_until_ms ?? displayFrame.ts, "PPpp")})
                       </div>
                     )}
                   </div>
                 </div>
                 <div>
                   <div className="text-xs text-text-muted">App</div>
-                  <div className="text-sm">{selected.app ?? "—"}</div>
+                  <div className="text-sm">{displayFrame.app ?? "—"}</div>
                 </div>
                 <div>
                   <div className="text-xs text-text-muted">Window</div>
                   <div className="text-sm break-words">
-                    {selected.window_title ?? "—"}
+                    {displayFrame.window_title ?? "—"}
                   </div>
                 </div>
                 <div>
                   <div className="flex items-center justify-between gap-2">
                     <div className="text-xs text-text-muted">File</div>
-                    <button
-                      type="button"
-                      className="inline-flex items-center gap-1 rounded border border-border px-1.5 py-0.5 text-[10px] text-text-muted hover:bg-bg-hover"
-                      title="Open in File Explorer"
-                      onClick={() => {
-                        void api.revealFrameInFolder(selected.path).catch(() => {});
-                      }}
-                    >
-                      <FolderOpen className="h-3 w-3" />
-                      Open location
-                    </button>
+                    <div className="flex gap-1">
+                      {frozenFrameUrl && (
+                        <button
+                          type="button"
+                          className="inline-flex items-center gap-1 rounded border border-border px-1.5 py-0.5 text-[10px] text-text-muted hover:bg-bg-hover"
+                          onClick={copyFrozenFrame}
+                          title="Copy frozen frame to clipboard"
+                        >
+                          <Copy className="h-3 w-3" />
+                          Copy Image
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        className="inline-flex items-center gap-1 rounded border border-border px-1.5 py-0.5 text-[10px] text-text-muted hover:bg-bg-hover"
+                        title="Open in File Explorer"
+                        onClick={() => {
+                          void api.revealFrameInFolder(displayFrame.video_path ?? displayFrame.path).catch(() => {});
+                        }}
+                      >
+                        <FolderOpen className="h-3 w-3" />
+                        Open location
+                      </button>
+                    </div>
                   </div>
                   <div className="mt-0.5 text-[11px] font-medium text-text break-all">
-                    {pathBasename(selected.path)}
+                    {pathBasename(displayFrame.video_path ?? displayFrame.path)}
                   </div>
                   <div className="mt-0.5 break-all font-mono text-[10px] leading-snug text-text-faint">
-                    {selected.path}
+                    {displayFrame.video_path ?? displayFrame.path}
                   </div>
                 </div>
                 <div className="flex flex-wrap gap-2 text-[10px] text-text-faint">
                   <span
                     className={
                       "rounded px-1.5 py-0.5 " +
-                      (selected.ocr_done
+                      (displayFrame.ocr_done
                         ? "bg-emerald-500/10 text-emerald-300"
                         : "bg-bg-hover")
                     }
                   >
-                    OCR {selected.ocr_done ? "✓" : "…"}
+                    OCR {displayFrame.ocr_done ? "✓" : "…"}
                   </span>
-                  <EmbedPill f={selected} />
+                  <EmbedPill f={displayFrame} />
                 </div>
                 <div>
                   <div className="flex items-center justify-between gap-2">
@@ -385,7 +592,7 @@ export default function Timeline() {
                     <div className="mt-1 text-xs text-text-faint">Loading…</div>
                   ) : ocrText == null || ocrText === "" ? (
                     <div className="mt-1 text-xs text-text-faint">
-                      {selected.ocr_done
+                      {displayFrame.ocr_done
                         ? "No text extracted."
                         : "OCR not finished yet."}
                     </div>
@@ -415,9 +622,9 @@ export default function Timeline() {
                   </div>
                   {embedLoading ? (
                     <div className="mt-1 text-xs text-text-faint">Loading…</div>
-                  ) : !selected.has_embedding || !embedPreview ? (
+                  ) : !displayFrame.has_embedding || !embedPreview ? (
                     <div className="mt-1 text-xs text-text-faint">
-                      {selected.embed_done
+                      {displayFrame.embed_done
                         ? "No vector stored for this frame."
                         : "Embedding not finished yet."}
                     </div>
@@ -456,6 +663,11 @@ export default function Timeline() {
             <div className="flex items-center gap-2 border-b border-border px-3 py-2 text-xs text-text-muted">
               <span className="shrink-0 font-mono">#{viewer.id}</span>
               <span className="truncate">{viewer.window_title ?? viewer.app ?? viewer.path}</span>
+              {viewer.video_path && (
+                <span className="ml-1 inline-flex items-center gap-1 rounded bg-blue-500/10 px-1.5 py-0.5 text-[10px] text-blue-300">
+                  <Film className="h-3 w-3" /> video
+                </span>
+              )}
               <button
                 type="button"
                 onClick={() => setViewerFullscreen((v) => !v)}
@@ -467,7 +679,7 @@ export default function Timeline() {
               <button
                 type="button"
                 onClick={() => {
-                  void api.revealFrameInFolder(viewer.path).catch(() => {});
+                  void api.revealFrameInFolder(viewer.video_path ?? viewer.path).catch(() => {});
                 }}
                 className="rounded border border-border p-1 hover:bg-bg-hover"
                 title="Open file location"
@@ -497,16 +709,31 @@ export default function Timeline() {
               </button>
             </div>
             <div className="h-[calc(100%-2.25rem)] w-full bg-black">
-              <img
-                src={api.assetUrl(viewer.path)}
-                alt={viewer.window_title ?? viewer.app ?? "Captured frame"}
-                decoding="async"
-                className="h-full w-full object-contain"
-                onContextMenu={(e) => {
-                  e.preventDefault();
-                  setMenu({ x: e.clientX, y: e.clientY, frame: viewer });
-                }}
-              />
+              {viewer.video_path ? (
+                <video
+                  src={api.assetUrl(viewer.video_path)}
+                  className="h-full w-full object-contain"
+                  controls
+                  autoPlay
+                  onLoadedMetadata={(e) => {
+                    const video = e.currentTarget;
+                    if (viewer.video_offset_ms) {
+                      video.currentTime = viewer.video_offset_ms / 1000;
+                    }
+                  }}
+                />
+              ) : (
+                <img
+                  src={api.assetUrl(viewer.path)}
+                  alt={viewer.window_title ?? viewer.app ?? "Captured frame"}
+                  decoding="async"
+                  className="h-full w-full object-contain"
+                  onContextMenu={(e) => {
+                    e.preventDefault();
+                    setMenu({ x: e.clientX, y: e.clientY, frame: viewer });
+                  }}
+                />
+              )}
             </div>
           </div>
         </div>
@@ -542,6 +769,63 @@ export default function Timeline() {
           </button>
         </div>
       )}
+    </div>
+  );
+}
+
+function VideoSegmentCard({
+  item,
+  selected,
+  onSelect,
+  onContextMenu,
+}: {
+  item: { type: "video"; videoPath: string; frames: Frame[] };
+  selected: Frame | null;
+  onSelect: (f: Frame) => void;
+  onContextMenu: (e: React.MouseEvent, f: Frame) => void;
+}) {
+  const first = item.frames[0];
+  const last = item.frames[item.frames.length - 1];
+  const isSelected = item.frames.some((f) => f.id === selected?.id);
+  const durationSec = Math.round((last.ts - first.ts) / 1000);
+  return (
+    <div
+      className={
+        "group overflow-hidden rounded-lg border bg-bg-elevated transition-all " +
+        (isSelected ? "border-accent ring-1 ring-accent" : "border-border hover:border-border-strong")
+      }
+    >
+      <div className="aspect-video bg-black/40 overflow-hidden">
+        <video
+          src={api.assetUrl(item.videoPath)}
+          className="h-full w-full object-cover opacity-90 group-hover:opacity-100"
+          preload="metadata"
+          muted
+          onLoadedMetadata={(e) => {
+            const video = e.currentTarget;
+            if (first.video_offset_ms) {
+              video.currentTime = first.video_offset_ms / 1000;
+            }
+          }}
+          onClick={() => onSelect(first)}
+          onContextMenu={(e) => onContextMenu(e, first)}
+        />
+      </div>
+      <div className="px-3 py-2">
+        <div className="flex items-center gap-1.5">
+          <Film className="h-3 w-3 text-blue-400" />
+          <span className="truncate text-xs text-text">
+            {first.window_title ?? first.app ?? "—"}
+          </span>
+        </div>
+        <div className="text-[10px] text-text-faint">
+          {format(first.ts, "HH:mm:ss")} – {format(last.ts, "HH:mm:ss")}
+          {" · "}
+          {item.frames.length} frames
+          {" · "}
+          {durationSec}s
+        </div>
+      </div>
     </div>
   );
 }

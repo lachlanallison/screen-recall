@@ -1,9 +1,14 @@
 import { useEffect, useMemo, useState } from "react";
+import { getVersion } from "@tauri-apps/api/app";
 import { api } from "../lib/api";
 import type {
   AppConfig,
+  ArchiverStatus,
+  CapturePerfSnapshot,
   HealthSnapshot,
+  PerPhaseStats,
   StageTimingStats,
+  Stats,
   WorkerQueueSnapshot,
 } from "../lib/api";
 
@@ -62,6 +67,37 @@ function formatStageTiming(t: StageTimingStats): string {
   return `Recent per frame (${t.sampleCount} samples): min ${formatMsStat(t.minMs)} · p50 ${formatMsStat(t.p50Ms)} · mean ${mean} · p95 ${formatMsStat(t.p95Ms)} · max ${formatMsStat(t.maxMs)}`;
 }
 
+function PhaseTimingRow({ label, t }: { label: string; t: StageTimingStats }) {
+  return (
+    <div className="flex flex-wrap items-baseline gap-x-3 gap-y-0.5 text-[11px]">
+      <span className="w-16 shrink-0 font-medium text-text-muted">{label}</span>
+      <span className="text-text-faint">
+        {t.sampleCount === 0 ? (
+          "no samples"
+        ) : (
+          <>
+            {t.sampleCount} samples · min {formatMsStat(t.minMs)} · p50{" "}
+            {formatMsStat(t.p50Ms)} · mean {formatMsStat(t.meanMs)} · p95{" "}
+            {formatMsStat(t.p95Ms)} · max {formatMsStat(t.maxMs)}
+          </>
+        )}
+      </span>
+    </div>
+  );
+}
+
+function PerPhaseCard({ title, stats }: { title: string; stats: PerPhaseStats }) {
+  return (
+    <div className="space-y-1.5 rounded border border-border/60 bg-bg p-3">
+      <div className="text-[11px] font-medium text-text">{title}</div>
+      <PhaseTimingRow label="Capture" t={stats.capture} />
+      <PhaseTimingRow label="Downscale" t={stats.downscale} />
+      <PhaseTimingRow label="Save" t={stats.save} />
+      <PhaseTimingRow label="Total" t={stats.total} />
+    </div>
+  );
+}
+
 function WorkerQueueBar({
   title,
   q,
@@ -101,8 +137,17 @@ function WorkerQueueBar({
   );
 }
 
+function formatBytes(bytes: number): string {
+  if (bytes === 0) return "0 B";
+  const k = 1024;
+  const sizes = ["B", "KB", "MB", "GB", "TB"];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + " " + sizes[i];
+}
+
 export default function Diagnostics() {
   const [loading, setLoading] = useState(false);
+  const [version, setVersion] = useState("");
   const [requeueEmbedBusy, setRequeueEmbedBusy] = useState(false);
   const [requeueEmbedMsg, setRequeueEmbedMsg] = useState<string | null>(null);
   const [config, setConfig] = useState<AppConfig | null>(null);
@@ -114,11 +159,15 @@ export default function Diagnostics() {
   const [processRaw, setProcessRaw] = useState("");
   const [queues, setQueues] = useState<WorkerQueueSnapshot | null>(null);
   const [health, setHealth] = useState<HealthSnapshot | null>(null);
+  const [stats, setStats] = useState<Stats | null>(null);
+  const [archiver, setArchiver] = useState<ArchiverStatus | null>(null);
+  const [capturePerf, setCapturePerf] = useState<CapturePerfSnapshot | null>(null);
+  const [showAllCapturePerf, setShowAllCapturePerf] = useState(false);
 
   const refresh = async () => {
     setLoading(true);
     try {
-      const [path, procPath, perf, runtime, processLines, q, snap] =
+      const [path, procPath, perf, runtime, processLines, q, snap, arch] =
         await Promise.all([
           api.getPerfLogPath(),
           api.getProcessLogPath(),
@@ -127,13 +176,18 @@ export default function Diagnostics() {
           api.getProcessLogTail(500),
           api.getWorkerQueueSnapshot().catch(() => null),
           api.getHealthSnapshot().catch(() => null),
+          api.getArchiverStatus().catch(() => null),
         ]);
-      const [cfg, status] = await Promise.all([
+      const [cfg, status, st, cp] = await Promise.all([
         api.getConfig(),
         api.getStatus(),
+        api.getStats().catch(() => null),
+        api.getCapturePerf().catch(() => null),
       ]);
       setConfig(cfg);
       setRecording(status.recording);
+      if (st) setStats(st);
+      if (cp) setCapturePerf(cp);
       setPerfPath(path);
       setProcessPath(procPath);
       setPerfRaw(perf.join("\n"));
@@ -141,6 +195,7 @@ export default function Diagnostics() {
       setProcessRaw(processLines.join("\n"));
       if (q) setQueues(q);
       setHealth(snap);
+      if (arch) setArchiver(arch);
     } finally {
       setLoading(false);
     }
@@ -163,6 +218,14 @@ export default function Diagnostics() {
 
     const lines = [
       "ScreenRecall Diagnostics",
+      `Version: ${version || "unknown"}`,
+      ...(stats
+        ? [
+            `Frames: ${stats.frameCount ?? 0} · Disk: ${formatBytes(stats.diskBytes ?? 0)} · Indexed: ${stats.indexedCount ?? 0} · Days recorded: ${stats.daysRecorded ?? 0}`,
+            `Unarchived: ${stats.unarchivedCount ?? 0} · Archived: ${stats.archivedCount ?? 0} · Pending deletion: ${stats.pendingDeletionCount ?? 0}`,
+            "",
+          ]
+        : []),
       `Perf log path: ${perfPath || "(unknown)"}`,
       `Process log path: ${processPath || "(unknown)"}`,
       `Events parsed: ${events.length}`,
@@ -196,6 +259,12 @@ export default function Diagnostics() {
                 }`,
             ),
             "",
+            "LLM backend usage:",
+            `- Chat: ${config?.llm_backend ?? "unknown"} → ${config?.llm_backend === "openai" ? (config?.openai_base_url || "(not set)") : (config?.ollama_url || "(not set)")}`,
+            `- Embeddings: ${config?.llm_backend ?? "unknown"} → ${config?.openai_embedding_base_url?.trim() || (config?.llm_backend === "openai" ? (config?.openai_base_url || "(not set)") : (config?.ollama_url || "(not set)"))}`,
+            `- Managed chat server: ${config?.managed_chat_server_command ? (health.managedServers.find((m) => m.kind === "chat")?.running ? "active" : "configured but not running") : "not configured"}`,
+            `- Managed embed server: ${config?.managed_embed_server_command ? (health.managedServers.find((m) => m.kind === "embed")?.running ? "active" : "configured but not running") : "not configured"}`,
+            "",
           ]
         : []),
       `OCR ok count: ${(by["ocr_ok"] ?? []).length}, median ms: ${median(ocr).toFixed(0)}`,
@@ -225,7 +294,7 @@ export default function Diagnostics() {
       lines.push(`- Embed timing (session): ${formatStageTiming(queues.embedTiming)}`);
     }
     return lines.join("\n");
-  }, [config, perfPath, processPath, perfRaw, recording, queues, health]);
+  }, [config, perfPath, processPath, perfRaw, recording, queues, health, version, stats]);
 
   const copy = async (text: string) => {
     try {
@@ -234,7 +303,9 @@ export default function Diagnostics() {
   };
 
   useEffect(() => {
+    getVersion().then(setVersion).catch(() => setVersion("unknown"));
     void refresh();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
@@ -245,9 +316,17 @@ export default function Diagnostics() {
           .then(setQueues)
           .catch(() => setQueues(null)),
         api
-          .getHealthSnapshot()
-          .then(setHealth)
-          .catch(() => setHealth(null)),
+          .getStats()
+          .then(setStats)
+          .catch(() => setStats(null)),
+        api
+          .getArchiverStatus()
+          .then(setArchiver)
+          .catch(() => setArchiver(null)),
+        api
+          .getCapturePerf()
+          .then(setCapturePerf)
+          .catch(() => setCapturePerf(null)),
       ]);
     };
     tick();
@@ -259,6 +338,9 @@ export default function Diagnostics() {
     <div className="flex h-full flex-col">
       <header className="flex h-12 items-center border-b border-border px-4">
         <h1 className="text-sm font-medium">Diagnostics</h1>
+        {version && (
+          <span className="ml-2 text-[11px] text-text-faint">v{version}</span>
+        )}
         <div className="ml-auto flex flex-wrap justify-end gap-2">
           <button
             type="button"
@@ -316,6 +398,28 @@ export default function Diagnostics() {
           {requeueEmbedMsg}
         </div>
       )}
+      {stats && (
+        <div className="border-b border-border px-4 py-3">
+          <div className="flex flex-wrap items-baseline gap-x-6 gap-y-1 text-xs">
+            <span className="text-text-faint">Frames:</span>
+            <span className="font-medium text-text">{(stats.frameCount ?? 0).toLocaleString()}</span>
+            <span className="text-text-faint">Disk:</span>
+            <span className="font-medium text-text">{formatBytes(stats.diskBytes ?? 0)}</span>
+            <span className="text-text-faint">Indexed:</span>
+            <span className="font-medium text-text">{(stats.indexedCount ?? 0).toLocaleString()}</span>
+            <span className="text-text-faint">Days recorded:</span>
+            <span className="font-medium text-text">{(stats.daysRecorded ?? 0).toLocaleString()}</span>
+          </div>
+          <div className="mt-1 flex flex-wrap items-baseline gap-x-6 gap-y-1 text-xs">
+            <span className="text-text-faint">Unarchived:</span>
+            <span className="font-medium text-text">{(stats.unarchivedCount ?? 0).toLocaleString()}</span>
+            <span className="text-text-faint">Archived:</span>
+            <span className="font-medium text-text">{(stats.archivedCount ?? 0).toLocaleString()}</span>
+            <span className="text-text-faint">Pending deletion:</span>
+            <span className="font-medium text-text">{(stats.pendingDeletionCount ?? 0).toLocaleString()}</span>
+          </div>
+        </div>
+      )}
       <div className="grid flex-1 grid-cols-1 gap-3 overflow-y-auto p-3 xl:grid-cols-2">
         <section className="col-span-1 flex flex-col gap-3 rounded-md border border-border bg-bg-elevated p-4 xl:col-span-2">
           <div>
@@ -352,6 +456,67 @@ export default function Diagnostics() {
             <p className="text-xs text-text-faint">Queue snapshot unavailable.</p>
           )}
         </section>
+
+        {capturePerf && (
+          <section className="col-span-1 space-y-4 rounded-md border border-border bg-bg-elevated p-4 xl:col-span-2">
+            <div className="flex items-start justify-between gap-2">
+              <div>
+                <h2 className="text-xs font-semibold text-text">Capture performance</h2>
+                <p className="mt-0.5 text-[11px] text-text-faint">
+                  Per-phase timings from the last ~120 captures per monitor. "Capture" = screen grab
+                  via xcap. "Downscale" = resize to max long edge (0 when skipped). "Save" = JPEG
+                  encode + disk write. Values in milliseconds.
+                </p>
+              </div>
+              <label className="flex shrink-0 cursor-pointer items-center gap-1.5 text-[11px] text-text-muted">
+                <input
+                  type="checkbox"
+                  checked={showAllCapturePerf}
+                  onChange={(e) => setShowAllCapturePerf(e.target.checked)}
+                  className="rounded border-border"
+                />
+                Include skipped
+              </label>
+            </div>
+
+            {showAllCapturePerf ? (
+              <div>
+                <h3 className="mb-2 text-[11px] font-medium text-text-muted">All frames (includes skipped)</h3>
+                <div className="grid gap-3 text-[11px] sm:grid-cols-2">
+                  <PerPhaseCard title="Overall" stats={capturePerf.overall} />
+                  {capturePerf.byMonitor.map((m) => (
+                    <PerPhaseCard
+                      key={m.monitorId}
+                      title={m.monitorName || `Monitor ${m.monitorId}`}
+                      stats={m.stats}
+                    />
+                  ))}
+                </div>
+              </div>
+            ) : capturePerf.savedOverall.sampleCount > 0 ? (
+              <div>
+                <h3 className="mb-2 text-[11px] font-medium text-text-muted">Saved frames only (written to disk)</h3>
+                <div className="grid gap-3 text-[11px] sm:grid-cols-2">
+                  <PerPhaseCard title="Overall saved" stats={capturePerf.savedOverall} />
+                  {capturePerf.savedByMonitor.map((m) => (
+                    <PerPhaseCard
+                      key={`saved-${m.monitorId}`}
+                      title={m.monitorName || `Monitor ${m.monitorId}`}
+                      stats={m.stats}
+                    />
+                  ))}
+                </div>
+              </div>
+            ) : (
+              <p className="text-[11px] text-text-faint">No saved-frame samples yet.</p>
+            )}
+
+            <div className="flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-text-faint">
+              <span>Last tick: {formatMsStat(capturePerf.lastTickMs)}</span>
+              <span>Enumeration: {formatMsStat(capturePerf.lastTickEnumMs)}</span>
+            </div>
+          </section>
+        )}
 
         <section className="col-span-1 space-y-2 rounded-md border border-border bg-bg-elevated p-4 xl:col-span-2">
           <div>
@@ -417,44 +582,175 @@ export default function Diagnostics() {
           )}
         </section>
 
-        <section className="flex min-h-0 flex-col rounded-md border border-border bg-bg-elevated">
+        {config && (
+          <section className="col-span-1 space-y-2 rounded-md border border-border bg-bg-elevated p-4 xl:col-span-2">
+            <div>
+              <h2 className="text-xs font-semibold text-text">LLM backend usage</h2>
+              <p className="mt-0.5 text-[11px] text-text-faint">
+                Shows which endpoint each pipeline (chat, embeddings) is hitting and whether a
+                managed local server is providing it.
+              </p>
+            </div>
+            {(() => {
+              const backend = config.llm_backend;
+              const isManagedChat = !!config.managed_chat_server_command?.trim();
+              const isManagedEmbed = !!config.managed_embed_server_command?.trim();
+              const chatRunning = health?.managedServers.find((m) => m.kind === "chat")?.running ?? false;
+              const embedRunning = health?.managedServers.find((m) => m.kind === "embed")?.running ?? false;
+
+              // Determine the actual endpoint each pipeline uses (mirrors Rust logic in embed/mod.rs and llm/mod.rs).
+              const chatEndpoint = backend === "openai"
+                ? config.openai_base_url || "(not set)"
+                : config.ollama_url || "(not set)";
+              const embedEndpoint = config.openai_embedding_base_url?.trim()
+                ? config.openai_embedding_base_url
+                : backend === "openai"
+                  ? config.openai_base_url || "(not set)"
+                  : config.ollama_url || "(not set)";
+
+              const embedUsesManaged = backend === "openai" && isManagedEmbed && embedRunning;
+
+              return (
+                <div className="grid gap-3 text-[11px] sm:grid-cols-2">
+                  <div className="space-y-1 rounded border border-border/60 bg-bg p-3">
+                    <div className="font-medium text-text">Chat pipeline</div>
+                    <div className="text-text-muted">Backend: <span className="font-mono">{backend}</span></div>
+                    <div className="text-text-muted">Endpoint: <span className="font-mono break-all">{chatEndpoint}</span></div>
+                    <div className="text-text-muted">
+                      Managed server:{" "}
+                      {isManagedChat ? (
+                        chatRunning ? (
+                          <span className="text-green-400">active (providing this endpoint)</span>
+                        ) : (
+                          <span className="text-amber-400">configured but not running</span>
+                        )
+                      ) : (
+                        <span>not configured</span>
+                      )}
+                    </div>
+                  </div>
+                  <div className="space-y-1 rounded border border-border/60 bg-bg p-3">
+                    <div className="font-medium text-text">Embeddings pipeline</div>
+                    <div className="text-text-muted">Backend: <span className="font-mono">{backend}</span></div>
+                    <div className="text-text-muted">Endpoint: <span className="font-mono break-all">{embedEndpoint}</span></div>
+                    <div className="text-text-muted">
+                      {config.openai_embedding_base_url?.trim() && backend === "openai" ? (
+                        <span>Dedicated embed URL set (overrides managed server)</span>
+                      ) : embedUsesManaged ? (
+                        <span className="text-green-400">Managed server active (providing this endpoint)</span>
+                      ) : isManagedEmbed && !embedRunning ? (
+                        <span className="text-amber-400">Managed server configured but not running</span>
+                      ) : backend === "ollama" ? (
+                        <span>Using Ollama endpoint (managed server not started for Ollama backend)</span>
+                      ) : (
+                        <span>Using OpenAI-compatible endpoint above</span>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              );
+            })()}
+          </section>
+        )}
+
+        {archiver && (
+          <section className="col-span-1 space-y-2 rounded-md border border-border bg-bg-elevated p-4 xl:col-span-2">
+            <div>
+              <h2 className="text-xs font-semibold text-text">Video archiver</h2>
+              <p className="mt-0.5 text-[11px] text-text-faint">
+                Periodically encodes recent frames into compressed video segments to reduce disk usage.
+              </p>
+            </div>
+            <div className="grid gap-3 text-[11px] sm:grid-cols-2">
+              <div className="space-y-1 rounded border border-border/60 bg-bg p-3">
+                <div className="font-medium text-text">Status</div>
+                <div className="text-text-muted">
+                  Enabled:{" "}
+                  {archiver.enabled ? (
+                    archiver.running ? (
+                      <span className="text-sky-400">running…</span>
+                    ) : (
+                      <span className="text-green-400">idle (waiting for next interval)</span>
+                    )
+                  ) : (
+                    <span>disabled (set archive interval &gt; 0 in Settings)</span>
+                  )}
+                </div>
+                {archiver.lastError && (
+                  <div className="text-red-400 break-all">Error: {archiver.lastError}</div>
+                )}
+              </div>
+              <div className="space-y-1 rounded border border-border/60 bg-bg p-3">
+                <div className="font-medium text-text">Last run</div>
+                <div className="text-text-muted">
+                  {archiver.lastRunTs
+                    ? `${new Date(archiver.lastRunTs).toLocaleTimeString()} · ${archiver.lastDurationMs ? `${archiver.lastDurationMs}ms` : "unknown duration"}`
+                    : "never"}
+                </div>
+              </div>
+              <div className="space-y-1 rounded border border-border/60 bg-bg p-3">
+                <div className="font-medium text-text">Totals</div>
+                <div className="text-text-muted">
+                  Archived: {(archiver.totalArchived ?? 0).toLocaleString()} frames ·{" "}
+                  {(archiver.totalSegments ?? 0).toLocaleString()} segments
+                </div>
+                <div className="text-text-muted">
+                  Source files deleted: {(archiver.totalSourceDeleted ?? 0).toLocaleString()}
+                </div>
+              </div>
+              {health && (
+                <div className="space-y-1 rounded border border-border/60 bg-bg p-3">
+                  <div className="font-medium text-text">Storage</div>
+                  <div className="text-text-muted">
+                    Archived frames: {(health.archivedFrameCount ?? 0).toLocaleString()}
+                  </div>
+                  <div className="text-text-muted">
+                    Unarchived frame files: {formatBytes(health.unarchivedFrameDiskBytes ?? 0)}
+                  </div>
+                </div>
+              )}
+            </div>
+          </section>
+        )}
+
+        <section className="col-span-1 flex flex-col rounded-md border border-border bg-bg-elevated xl:col-span-1">
           <div className="border-b border-border px-3 py-2 text-xs text-text-muted">
             Pasteable report
           </div>
           <textarea
             readOnly
             value={report}
-            className="h-full w-full resize-none bg-transparent p-3 font-mono text-xs text-text outline-none"
+            className="flex-1 min-h-48 w-full resize-none bg-transparent p-3 font-mono text-xs text-text outline-none"
           />
         </section>
-        <section className="flex min-h-0 flex-col rounded-md border border-border bg-bg-elevated">
+        <section className="col-span-1 flex flex-col rounded-md border border-border bg-bg-elevated xl:col-span-1">
           <div className="border-b border-border px-3 py-2 text-xs text-text-muted">
             Perf log JSONL (latest 500 lines)
           </div>
           <textarea
             readOnly
             value={perfRaw || "(No perf log lines yet. Use the app, then Refresh.)"}
-            className="h-full w-full resize-none bg-transparent p-3 font-mono text-xs text-text outline-none"
+            className="flex-1 min-h-48 w-full resize-none bg-transparent p-3 font-mono text-xs text-text outline-none"
           />
         </section>
-        <section className="col-span-1 flex min-h-0 flex-col rounded-md border border-border bg-bg-elevated xl:col-span-2">
+        <section className="col-span-1 flex flex-col rounded-md border border-border bg-bg-elevated xl:col-span-2">
           <div className="border-b border-border px-3 py-2 text-xs text-text-muted">
             Runtime log (if configured)
           </div>
           <textarea
             readOnly
             value={runtimeRaw || "(Runtime log not present yet.)"}
-            className="h-full min-h-36 w-full resize-none bg-transparent p-3 font-mono text-xs text-text outline-none"
+            className="flex-1 min-h-36 w-full resize-none bg-transparent p-3 font-mono text-xs text-text outline-none"
           />
         </section>
-        <section className="col-span-1 flex min-h-0 flex-col rounded-md border border-border bg-bg-elevated xl:col-span-2">
+        <section className="col-span-1 flex flex-col rounded-md border border-border bg-bg-elevated xl:col-span-2">
           <div className="border-b border-border px-3 py-2 text-xs text-text-muted">
             Process spawn log JSONL (latest 500 lines)
           </div>
           <textarea
             readOnly
             value={processRaw || "(No process spawn log lines yet.)"}
-            className="h-full min-h-36 w-full resize-none bg-transparent p-3 font-mono text-xs text-text outline-none"
+            className="flex-1 min-h-36 w-full resize-none bg-transparent p-3 font-mono text-xs text-text outline-none"
           />
         </section>
       </div>

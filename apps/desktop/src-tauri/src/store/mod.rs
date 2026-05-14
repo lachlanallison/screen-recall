@@ -27,6 +27,10 @@ pub struct Frame {
     pub has_embedding: bool,
     /// Last time (unix ms) this still matched; equals `ts` if never deduped. Held ≈ `static_until_ms - ts`.
     pub static_until_ms: i64,
+    /// Path to archived video segment (null = still on disk as individual frame file).
+    pub video_path: Option<String>,
+    /// Millisecond offset into `video_path` where this frame lives.
+    pub video_offset_ms: Option<i64>,
 }
 
 pub struct Store {
@@ -52,6 +56,7 @@ impl Store {
         )?;
         conn.execute_batch(SCHEMA)?;
         migrate_frames_static_until(&conn)?;
+        migrate_frames_video_columns(&conn)?;
         backfill_embed_done_for_empty_ocr(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -111,7 +116,8 @@ impl Store {
         let mut stmt = guard.prepare(
             "SELECT f.id, f.ts, f.path, f.app, f.window_title, f.monitor_id, f.ocr_done, f.embed_done,
                     COALESCE(f.static_until_ms, f.ts) AS static_until_ms,
-                    EXISTS(SELECT 1 FROM embeddings e WHERE e.frame_id = f.id) AS has_embedding
+                    EXISTS(SELECT 1 FROM embeddings e WHERE e.frame_id = f.id) AS has_embedding,
+                    f.video_path, f.video_offset_ms
              FROM frames f
              WHERE (?1 IS NULL OR f.ts < ?1)
              ORDER BY f.ts DESC
@@ -129,7 +135,8 @@ impl Store {
             .query_row(
                 "SELECT f.id, f.ts, f.path, f.app, f.window_title, f.monitor_id, f.ocr_done, f.embed_done,
                         COALESCE(f.static_until_ms, f.ts) AS static_until_ms,
-                        EXISTS(SELECT 1 FROM embeddings e WHERE e.frame_id = f.id) AS has_embedding
+                        EXISTS(SELECT 1 FROM embeddings e WHERE e.frame_id = f.id) AS has_embedding,
+                        f.video_path, f.video_offset_ms
                  FROM frames f WHERE f.id = ?1",
                 params![id],
                 row_to_frame,
@@ -212,6 +219,7 @@ impl Store {
             "SELECT f.id, f.ts, f.path, f.app, f.window_title, f.monitor_id, f.ocr_done, f.embed_done,
                     COALESCE(f.static_until_ms, f.ts) AS s_until,
                     EXISTS(SELECT 1 FROM embeddings e WHERE e.frame_id = f.id) AS has_embedding,
+                    f.video_path, f.video_offset_ms,
                     snippet(ocr_text, 0, '<<', '>>', '…', 16) AS snip,
                     bm25(ocr_text) AS score
              FROM ocr_text
@@ -235,10 +243,11 @@ impl Store {
                     embed_done: row.get::<_, i32>(7)? != 0,
                     has_embedding: has_embedding != 0,
                     static_until_ms,
+                    video_path: row.get(10)?,
+                    video_offset_ms: row.get(11)?,
                 };
-                let snippet: String = row.get(10)?;
-                // bm25 returns negative-ish scores where lower is better; map to [0,1].
-                let raw: f64 = row.get(11)?;
+                let snippet: String = row.get(12)?;
+                let raw: f64 = row.get(13)?;
                 let score = 1.0 / (1.0 + (raw.abs() as f32));
                 Ok((frame, snippet, score))
             })?
@@ -283,7 +292,9 @@ impl Store {
         let guard = self.conn.lock().unwrap();
         let mut stmt = guard.prepare(
             "SELECT f.id, f.ts, f.path, f.app, f.window_title, f.monitor_id, f.ocr_done, f.embed_done,
-                    COALESCE(f.static_until_ms, f.ts) AS s_until, e.dim, e.vector
+                    COALESCE(f.static_until_ms, f.ts) AS s_until,
+                    f.video_path, f.video_offset_ms,
+                    e.dim, e.vector
              FROM embeddings e
              JOIN frames f ON f.id = e.frame_id",
         )?;
@@ -300,9 +311,11 @@ impl Store {
                 embed_done: row.get::<_, i32>(7)? != 0,
                 has_embedding: true,
                 static_until_ms,
+                video_path: row.get(9)?,
+                video_offset_ms: row.get(10)?,
             };
-            let dim: i64 = row.get(9)?;
-            let blob: Vec<u8> = row.get(10)?;
+            let dim: i64 = row.get(11)?;
+            let blob: Vec<u8> = row.get(12)?;
             Ok((frame, dim, blob))
         })?;
 
@@ -454,6 +467,188 @@ impl Store {
         Ok((frames, indexed))
     }
 
+    /// Unix ms of the earliest captured frame, or `None` if no frames exist.
+    pub fn first_frame_ts(&self) -> Result<Option<i64>> {
+        let guard = self.conn.lock().unwrap();
+        let ts: Option<i64> = guard
+            .query_row("SELECT MIN(ts) FROM frames", [], |r| r.get(0))
+            .optional()?;
+        Ok(ts)
+    }
+
+    /// Number of distinct calendar days that contain at least one frame.
+    pub fn days_recorded(&self) -> Result<i64> {
+        let guard = self.conn.lock().unwrap();
+        let n: i64 = guard.query_row(
+            "SELECT COUNT(DISTINCT strftime('%Y-%m-%d', ts / 1000, 'unixepoch')) FROM frames",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(n)
+    }
+
+    /// Update a batch of frames to point to an archived video segment.
+    /// `offsets` is a vec of (frame_id, offset_ms) pairs.
+    pub fn set_video_archive(
+        &self,
+        video_path: &str,
+        offsets: &[(i64, i64)],
+    ) -> Result<()> {
+        let guard = self.conn.lock().unwrap();
+        let mut stmt = guard.prepare(
+            "UPDATE frames SET video_path = ?1, video_offset_ms = ?2 WHERE id = ?3",
+        )?;
+        for (id, offset) in offsets {
+            stmt.execute(params![video_path, offset, id])?;
+        }
+        Ok(())
+    }
+
+    /// Delete individual frame files for frames that have been archived to video.
+    /// Returns the paths that were deleted.
+    pub fn delete_archived_frame_files(&self, before_ts: i64) -> Result<Vec<String>> {
+        let guard = self.conn.lock().unwrap();
+        let mut stmt = guard.prepare(
+            "SELECT path FROM frames WHERE video_path IS NOT NULL AND ts < ?1",
+        )?;
+        let paths: Vec<String> = stmt
+            .query_map(params![before_ts], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+        for p in &paths {
+            let _ = std::fs::remove_file(p);
+        }
+        Ok(paths)
+    }
+
+    /// Count of frames that have been archived to video.
+    pub fn archived_frame_count(&self) -> Result<i64> {
+        let guard = self.conn.lock().unwrap();
+        let n: i64 = guard.query_row(
+            "SELECT COUNT(*) FROM frames WHERE video_path IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(n)
+    }
+
+    /// Count of frames that have NOT been archived to video.
+    pub fn unarchived_frame_count(&self) -> Result<i64> {
+        let guard = self.conn.lock().unwrap();
+        let n: i64 = guard.query_row(
+            "SELECT COUNT(*) FROM frames WHERE video_path IS NULL",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(n)
+    }
+
+    /// Count of archived frames whose source files are still on disk
+    /// (i.e. archived but not yet old enough to delete).
+    pub fn pending_deletion_frame_count(&self, keep_cutoff_ms: i64) -> Result<i64> {
+        let guard = self.conn.lock().unwrap();
+        let n: i64 = guard.query_row(
+            "SELECT COUNT(*) FROM frames WHERE video_path IS NOT NULL AND ts >= ?1",
+            params![keep_cutoff_ms],
+            |r| r.get(0),
+        )?;
+        Ok(n)
+    }
+
+    /// List all distinct video paths that have been archived.
+    pub fn list_archived_video_paths(&self) -> Result<Vec<String>> {
+        let guard = self.conn.lock().unwrap();
+        let mut stmt = guard.prepare(
+            "SELECT DISTINCT video_path FROM frames WHERE video_path IS NOT NULL ORDER BY video_path"
+        )?;
+        let paths: Vec<String> = stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(paths)
+    }
+
+    /// Total size on disk of individual frame files (excludes archived video files).
+    pub fn unarchived_frame_disk_bytes(&self) -> Result<u64> {
+        let guard = self.conn.lock().unwrap();
+        let mut stmt = guard.prepare(
+            "SELECT path FROM frames WHERE video_path IS NULL",
+        )?;
+        let paths: Vec<String> = stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut total: u64 = 0;
+        for p in &paths {
+            if let Ok(m) = std::fs::metadata(p) {
+                total += m.len();
+            }
+        }
+        Ok(total)
+    }
+
+    /// List distinct monitor IDs that have unarchived frames before `cutoff_ms`.
+    pub fn list_monitors_with_unarchived(&self, cutoff_ms: i64) -> Result<Vec<i32>> {
+        let guard = self.conn.lock().unwrap();
+        let mut stmt = guard.prepare(
+            "SELECT DISTINCT monitor_id FROM frames WHERE video_path IS NULL AND ts < ?1 ORDER BY monitor_id",
+        )?;
+        let ids: Vec<i32> = stmt
+            .query_map(params![cutoff_ms], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ids)
+    }
+
+    /// List distinct monitor IDs that have fully-indexed unarchived frames in [min_ts, cutoff_ms].
+    /// Only returns frames where OCR and embedding are complete, so the archiver never archives
+    /// ahead of the indexer pipeline.
+    pub fn list_monitors_with_unarchived_range(&self, min_ts: i64, cutoff_ms: i64) -> Result<Vec<i32>> {
+        let guard = self.conn.lock().unwrap();
+        let mut stmt = guard.prepare(
+            "SELECT DISTINCT monitor_id FROM frames WHERE video_path IS NULL AND ocr_done = 1 AND embed_done = 1 AND ts >= ?1 AND ts < ?2 ORDER BY monitor_id",
+        )?;
+        let ids: Vec<i32> = stmt
+            .query_map(params![min_ts, cutoff_ms], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ids)
+    }
+
+    /// List unarchived frames for a given monitor, ordered by timestamp.
+    pub fn list_unarchived_for_monitor(
+        &self,
+        monitor_id: i32,
+        cutoff_ms: i64,
+    ) -> Result<Vec<(i64, i64, String)>> {
+        let guard = self.conn.lock().unwrap();
+        let mut stmt = guard.prepare(
+            "SELECT id, ts, path FROM frames WHERE monitor_id = ?1 AND video_path IS NULL AND ocr_done = 1 AND embed_done = 1 AND ts < ?2 ORDER BY ts ASC",
+        )?;
+        let rows: Vec<(i64, i64, String)> = stmt
+            .query_map(params![monitor_id, cutoff_ms], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// List unarchived frames for a given monitor in [min_ts, cutoff_ms], ordered by timestamp.
+    /// Only returns fully-indexed frames so the archiver never archives ahead of OCR/embed.
+    pub fn list_unarchived_for_monitor_range(
+        &self,
+        monitor_id: i32,
+        min_ts: i64,
+        cutoff_ms: i64,
+    ) -> Result<Vec<(i64, i64, String)>> {
+        let guard = self.conn.lock().unwrap();
+        let mut stmt = guard.prepare(
+            "SELECT id, ts, path FROM frames WHERE monitor_id = ?1 AND video_path IS NULL AND ocr_done = 1 AND embed_done = 1 AND ts >= ?2 AND ts < ?3 ORDER BY ts ASC",
+        )?;
+        let rows: Vec<(i64, i64, String)> = stmt
+            .query_map(params![monitor_id, min_ts, cutoff_ms], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn delete_all(&self) -> Result<()> {
         let guard = self.conn.lock().unwrap();
         guard.execute_batch(
@@ -475,6 +670,8 @@ fn row_to_frame(row: &rusqlite::Row<'_>) -> rusqlite::Result<Frame> {
         embed_done: row.get::<_, i32>(7)? != 0,
         static_until_ms: row.get(8)?,
         has_embedding: row.get::<_, i32>(9)? != 0,
+        video_path: row.get(10)?,
+        video_offset_ms: row.get(11)?,
     })
 }
 
@@ -505,6 +702,24 @@ fn migrate_frames_static_until(conn: &Connection) -> Result<()> {
             [],
         )
         .context("backfill static_until_ms")?;
+    }
+    Ok(())
+}
+
+fn migrate_frames_video_columns(conn: &Connection) -> Result<()> {
+    for (col, default) in [("video_path", "TEXT"), ("video_offset_ms", "INTEGER")] {
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('frames') WHERE name = ?1",
+            params![col],
+            |r| r.get(0),
+        )?;
+        if n == 0 {
+            conn.execute(
+                &format!("ALTER TABLE frames ADD COLUMN {} {}", col, default),
+                [],
+            )
+            .with_context(|| format!("add {} to frames", col))?;
+        }
     }
     Ok(())
 }

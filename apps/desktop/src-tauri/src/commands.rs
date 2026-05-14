@@ -18,6 +18,8 @@ use tauri::{Emitter, Manager, State};
 use tokio::sync::{mpsc, Notify};
 use tokio::time::timeout;
 
+use crate::archive::{self, ArchiverStatus, EncoderAvailability};
+use crate::capture_perf::CapturePerfSnapshot;
 use crate::config::{AppConfig, LlmBackend};
 use crate::llm::{self, prompts, ChatMessage};
 use crate::search;
@@ -396,6 +398,10 @@ pub struct HealthSnapshot {
     /// Quick probe of common install locations only (PATH-only installs not detected here).
     pub tesseract_known_path: Option<String>,
     pub managed_servers: Vec<ManagedLlamaStatus>,
+    /// Count of frames that have been archived to video segments.
+    pub archived_frame_count: i64,
+    /// Size on disk of unarchived individual frame files (bytes).
+    pub unarchived_frame_disk_bytes: u64,
 }
 
 fn file_metadata_len_mb(path: &std::path::Path) -> f64 {
@@ -453,7 +459,28 @@ pub async fn get_health_snapshot(state: AppStateHandle<'_>) -> CmdResult<HealthS
         sqlite_shm_mb: file_metadata_len_mb(&shm),
         tesseract_known_path: probe_tesseract_known_path(),
         managed_servers: managed,
+        archived_frame_count: shared.cached_archived_count(),
+        unarchived_frame_disk_bytes: shared.cached_unarchived_bytes(),
     })
+}
+
+/// FFmpeg encoder availability probe.
+#[tauri::command]
+pub async fn get_encoder_availability() -> CmdResult<EncoderAvailability> {
+    Ok(archive::probe_encoders().await)
+}
+
+/// Clear encoder cache and re-probe.
+#[tauri::command]
+pub async fn refresh_encoder_availability() -> CmdResult<EncoderAvailability> {
+    archive::clear_encoder_cache();
+    Ok(archive::probe_encoders().await)
+}
+
+/// Current archiver worker status.
+#[tauri::command]
+pub fn get_archiver_status() -> CmdResult<ArchiverStatus> {
+    Ok(archive::get_archiver_status())
 }
 
 fn trim_base_url(s: &str) -> String {
@@ -920,6 +947,148 @@ pub fn install_ollama(state: AppStateHandle<'_>) -> CmdResult<()> {
 }
 
 #[tauri::command]
+pub fn install_ffmpeg(state: AppStateHandle<'_>) -> CmdResult<()> {
+    #[cfg(target_os = "windows")]
+    {
+        process_log::record(
+            state.inner(),
+            "install_ffmpeg",
+            "winget",
+            &[
+                "install".into(),
+                "--id".into(),
+                "Gyan.FFmpeg".into(),
+                "-e".into(),
+                "--accept-package-agreements".into(),
+                "--accept-source-agreements".into(),
+            ],
+            None,
+        );
+        // Use visible command so user can see progress/interact with UAC
+        let mut c = std::process::Command::new("winget");
+        c.args([
+            "install",
+            "--id",
+            "Gyan.FFmpeg",
+            "-e",
+            "--accept-package-agreements",
+            "--accept-source-agreements",
+        ]);
+        let status = c.status().map_err(err)?;
+        if status.success() {
+            // After successful install, try to fix PATH automatically.
+            let _ = ensure_ffmpeg_path();
+            archive::clear_encoder_cache();
+            Ok(())
+        } else {
+            Err("FFmpeg install failed. Check the terminal window for details.".into())
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut c = std::process::Command::new("brew");
+        c.args(["install", "ffmpeg"]);
+        let status = c.status().map_err(err)?;
+        if status.success() { Ok(()) } else { Err("brew install ffmpeg failed".into()) }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let mut c = std::process::Command::new("sh");
+        c.args(["-c", "sudo apt-get update && sudo apt-get install -y ffmpeg"]);
+        let status = c.status().map_err(err)?;
+        if status.success() { Ok(()) } else { Err("apt install ffmpeg failed".into()) }
+    }
+}
+
+/// On Windows, searches common install locations for FFmpeg and adds the directory
+/// to the user's PATH if found. Returns the path added, or empty string if not found.
+#[tauri::command]
+pub fn ensure_ffmpeg_path() -> CmdResult<String> {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+        // Common locations where winget or manual installs put ffmpeg.
+        let base_dirs = directories::BaseDirs::new();
+        let candidates = [
+            base_dirs.as_ref().map(|d| d.data_local_dir().join("Programs").join("Gyan.FFmpeg").join("bin")),
+            base_dirs.as_ref().map(|d| d.data_local_dir().join("Programs").join("FFmpeg").join("bin")),
+            Some(std::path::PathBuf::from(r"C:\Program Files\ffmpeg\bin")),
+            Some(std::path::PathBuf::from(r"C:\Program Files (x86)\ffmpeg\bin")),
+        ];
+
+        for candidate in candidates.into_iter().flatten() {
+            if candidate.join("ffmpeg.exe").exists() {
+                let dir_str = candidate.to_string_lossy().to_string();
+                
+                // Check if already in PATH
+                let current_path = std::env::var("PATH").unwrap_or_default();
+                if current_path.contains(&dir_str) {
+                    return Ok("".into()); // Already in PATH
+                }
+
+                // Append to user PATH via Registry
+                let new_path = if current_path.is_empty() {
+                    dir_str.clone()
+                } else {
+                    format!("{};{}", current_path, dir_str)
+                };
+
+                let mut reg_cmd = std::process::Command::new("reg");
+                reg_cmd.creation_flags(CREATE_NO_WINDOW);
+                reg_cmd.args([
+                    "add",
+                    r"HKCU\Environment",
+                    "/v", "Path",
+                    "/t", "REG_EXPAND_SZ",
+                    "/d", &new_path,
+                    "/f",
+                ]);
+                
+                let out = reg_cmd.output().map_err(err)?;
+                if out.status.success() {
+                    // Also update the current process PATH so `Command::new("ffmpeg")` works
+                    // immediately without requiring an app restart.
+                    std::env::set_var("PATH", &new_path);
+                    archive::clear_encoder_cache();
+                    return Ok(dir_str);
+                }
+            }
+        }
+        Err("FFmpeg executable not found in standard locations.".into())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Err("PATH update is only supported on Windows.".into())
+    }
+}
+
+/// Archive all unarchived frame history into video segments now.
+#[tauri::command]
+pub async fn archive_history_now(state: AppStateHandle<'_>) -> CmdResult<(usize, usize, usize)> {
+    let cfg = state.config();
+    if !cfg.archive_enabled {
+        return Err("Video archiving is disabled. Enable it in Settings first.".into());
+    }
+    let shared: Arc<AppState> = state.inner().clone();
+    archive::archive_history(&shared, &cfg).await.map_err(err)
+}
+
+/// Re-encode all existing archived videos to the target codec.
+#[tauri::command]
+pub async fn transcode_archives(
+    app: tauri::AppHandle,
+    state: AppStateHandle<'_>,
+    target_codec: String,
+) -> CmdResult<(usize, usize)> {
+    let shared: Arc<AppState> = state.inner().clone();
+    archive::transcode_all_videos(&shared, &target_codec, app)
+        .await
+        .map_err(err)
+}
+
+#[tauri::command]
 pub fn complete_setup(state: AppStateHandle<'_>) -> CmdResult<()> {
     let mut cfg = state.config();
     cfg.setup_complete = true;
@@ -927,20 +1096,70 @@ pub fn complete_setup(state: AppStateHandle<'_>) -> CmdResult<()> {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Stats {
     pub frame_count: i64,
-    pub disk_mb: f64,
+    pub disk_bytes: u64,
     pub indexed_count: i64,
+    /// Distinct calendar days with at least one frame.
+    pub days_recorded: i64,
+    /// Frames that have not yet been archived to video.
+    pub unarchived_count: i64,
+    /// Frames that have been archived to video.
+    pub archived_count: i64,
+    /// Archived frames whose source files are still on disk (not yet past keep threshold).
+    pub pending_deletion_count: i64,
 }
 
 #[tauri::command]
 pub fn get_stats(state: AppStateHandle<'_>) -> CmdResult<Stats> {
     let (frames, indexed) = state.cached_counts();
-    let disk_mb = state.cached_disk_mb();
+    let disk_bytes = state.cached_disk_bytes();
+    let days_recorded = state.store.days_recorded().unwrap_or(0);
+    let unarchived = state.cached_unarchived_count();
+    let archived = state.cached_archived_count();
+    let cfg = state.config();
+    let pending = if cfg.archive_keep_frames_days > 0 {
+        let keep_cutoff = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64
+            - (cfg.archive_keep_frames_days as i64 * 24 * 3600 * 1000);
+        state.store.pending_deletion_frame_count(keep_cutoff).unwrap_or(0)
+    } else {
+        archived
+    };
     Ok(Stats {
         frame_count: frames,
-        disk_mb,
+        disk_bytes,
         indexed_count: indexed,
+        days_recorded,
+        unarchived_count: unarchived,
+        archived_count: archived,
+        pending_deletion_count: pending,
+    })
+}
+
+/// Rolling capture performance snapshot (per-phase timings).
+#[tauri::command]
+pub fn get_capture_perf(state: AppStateHandle<'_>) -> CmdResult<CapturePerfSnapshot> {
+    Ok(state.capture_perf.snapshot())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiskStatus {
+    pub warning: bool,
+    pub stopped: bool,
+    pub free_pct: f64,
+}
+
+#[tauri::command]
+pub fn get_disk_status(state: AppStateHandle<'_>) -> CmdResult<DiskStatus> {
+    Ok(DiskStatus {
+        warning: state.disk_warning(),
+        stopped: state.disk_stopped(),
+        free_pct: state.disk_free_pct(),
     })
 }
 
@@ -1387,6 +1606,21 @@ pub struct LaunchOnStartupStatus {
     pub detail: String,
 }
 const RUN_KEY: &str = "ScreenRecall";
+
+#[tauri::command]
+pub fn restart_app() -> CmdResult<()> {
+    let exe = std::env::current_exe().map_err(err)?;
+    let mut cmd = std::process::Command::new(&exe);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_CONSOLE: u32 = 0x00000010;
+        cmd.creation_flags(CREATE_NEW_CONSOLE);
+    }
+    cmd.spawn().map_err(err)?;
+    std::process::exit(0);
+}
+
 
 #[tauri::command]
 pub fn get_launch_on_startup_status(state: AppStateHandle<'_>) -> CmdResult<LaunchOnStartupStatus> {

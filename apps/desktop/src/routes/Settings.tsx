@@ -1,11 +1,27 @@
 import { useEffect, useState } from "react";
 import { FolderOpen, Trash2 } from "lucide-react";
+import { listen } from "@tauri-apps/api/event";
 import {
   api,
   type AppConfig,
+  type ArchiverStatus,
   type DependencyReport,
+  type EncoderAvailability,
+  type EncoderPreset,
   type ManagedLlamaStatus,
 } from "../lib/api";
+
+const KNOWN_ENCODER_OPTIONS: Omit<EncoderPreset, "compressionRatio">[] = [
+  { id: "h264", label: "H.264 (software)", ffmpegEncoder: "libx264", description: "Universal compatibility, fast encode", hardwareOnly: false },
+  { id: "h264_qsv", label: "H.264 (Intel QSV)", ffmpegEncoder: "h264_qsv", description: "Intel hardware encode, very fast", hardwareOnly: true },
+  { id: "h264_nvenc", label: "H.264 (NVIDIA NVENC)", ffmpegEncoder: "h264_nvenc", description: "NVIDIA hardware encode, very fast", hardwareOnly: true },
+  { id: "h265", label: "H.265/HEVC (software)", ffmpegEncoder: "libx265", description: "40-50% smaller than H.264, slower encode", hardwareOnly: false },
+  { id: "h265_qsv", label: "H.265/HEVC (Intel QSV)", ffmpegEncoder: "hevc_qsv", description: "Intel hardware HEVC encode", hardwareOnly: true },
+  { id: "h265_nvenc", label: "H.265/HEVC (NVIDIA NVENC)", ffmpegEncoder: "hevc_nvenc", description: "NVIDIA hardware HEVC encode", hardwareOnly: true },
+  { id: "av1_qsv", label: "AV1 (Intel QSV)", ffmpegEncoder: "av1_qsv", description: "Intel Arc hardware AV1, smallest files", hardwareOnly: true },
+  { id: "av1_nvenc", label: "AV1 (NVIDIA NVENC)", ffmpegEncoder: "av1_nvenc", description: "NVIDIA hardware AV1 encode", hardwareOnly: true },
+  { id: "vp9", label: "VP9 (software)", ffmpegEncoder: "libvpx-vp9", description: "Google's open codec, good compression", hardwareOnly: false },
+];
 
 export default function Settings() {
   const [config, setConfig] = useState<AppConfig | null>(null);
@@ -28,12 +44,36 @@ export default function Settings() {
   const [depReport, setDepReport] = useState<DependencyReport | null>(null);
   const [depLoading, setDepLoading] = useState(false);
   const [depDismissed, setDepDismissed] = useState(false);
+  const [encoders, setEncoders] = useState<EncoderAvailability | null>(null);
+  const [archiver, setArchiver] = useState<ArchiverStatus | null>(null);
+  const [ffmpegInstallBusy, setFfmpegInstallBusy] = useState(false);
+  const [ffmpegInstallMsg, setFfmpegInstallMsg] = useState<string | null>(null);
+  const [transcodeBusy, setTranscodeBusy] = useState(false);
+  const [transcodeProgress, setTranscodeProgress] = useState<{ current: number; total: number; file: string } | null>(null);
 
   useEffect(() => {
     api
       .getConfig()
       .then(setConfig)
       .catch((e) => console.error(e));
+  }, []);
+
+  useEffect(() => {
+    let mounted = true;
+    const unlisten = listen("transcode:progress", (event) => {
+      if (!mounted) return;
+      const payload = event.payload as { current: number; total: number; file: string; status?: string };
+      if (payload.status === "done") {
+        setTranscodeBusy(false);
+        setTranscodeProgress(null);
+      } else {
+        setTranscodeProgress({ current: payload.current, total: payload.total, file: payload.file });
+      }
+    });
+    return () => {
+      mounted = false;
+      unlisten.then((f) => f());
+    };
   }, []);
 
   useEffect(() => {
@@ -83,6 +123,40 @@ export default function Settings() {
       .catch(() => {});
     return () => {
       mounted = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    let mounted = true;
+    void api
+      .refreshEncoderAvailability()
+      .then((e) => {
+        console.log("[Settings] initial encoder probe:", e);
+        if (mounted) setEncoders(e);
+      })
+      .catch((err) => {
+        console.error("[Settings] initial encoder probe failed:", err);
+      });
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    let mounted = true;
+    const poll = async () => {
+      try {
+        const a = await api.getArchiverStatus();
+        if (mounted) setArchiver(a);
+      } catch {
+        if (mounted) setArchiver(null);
+      }
+    };
+    void poll();
+    const id = window.setInterval(() => void poll(), 5000);
+    return () => {
+      mounted = false;
+      clearInterval(id);
     };
   }, []);
 
@@ -203,6 +277,11 @@ export default function Settings() {
   const statusFor = (kind: "chat" | "embed"): ManagedLlamaStatus | null =>
     managed.find((m) => m.kind === kind) ?? null;
 
+  const showManagedError = (message: string) => {
+    setManagedMsg(message);
+    window.alert(message);
+  };
+
   const startManaged = async (kind: "chat" | "embed") => {
     if (!config) return;
     const command =
@@ -210,7 +289,7 @@ export default function Settings() {
         ? (config.managed_chat_server_command ?? "")
         : (config.managed_embed_server_command ?? "");
     if (!command.trim()) {
-      setManagedMsg(
+      showManagedError(
         `Set a ${kind} server command first (Managed llama.cpp section).`,
       );
       return;
@@ -228,7 +307,7 @@ export default function Settings() {
       );
       setManaged(await api.getManagedLlamaStatus());
     } catch (e) {
-      setManagedMsg(`Start ${kind} server failed: ${String(e)}`);
+      showManagedError(`Start ${kind} server failed: ${String(e)}`);
     } finally {
       setManagedBusy(null);
     }
@@ -242,9 +321,14 @@ export default function Settings() {
       setManagedMsg(
         `Started: ${r.started.join(", ") || "(none)"}; skipped (no command): ${r.skipped.join(", ") || "(none)"}`,
       );
+      if (r.skipped.length > 0) {
+        window.alert(
+          `Some managed servers were skipped because no command is set: ${r.skipped.join(", ")}. Configure commands in Settings -> Managed llama.cpp.`,
+        );
+      }
       setManaged(await api.getManagedLlamaStatus());
     } catch (e) {
-      setManagedMsg(`Start both failed: ${String(e)}`);
+      showManagedError(`Start both failed: ${String(e)}`);
     } finally {
       setManagedBusy(null);
     }
@@ -362,6 +446,73 @@ export default function Settings() {
                 className="input"
               />
             </Field>
+            <Field label="Max frame long edge (0 = full resolution)">
+              <input
+                type="number"
+                min={0}
+                max={7680}
+                step={10}
+                value={config.capture_downscale_max_edge}
+                onChange={(e) =>
+                  patch({
+                    capture_downscale_max_edge: Math.max(0, Math.min(7680, Number(e.target.value) || 0)),
+                  })
+                }
+                className="input"
+              />
+              <p className="mt-1 text-[11px] text-text-faint">
+                Downscale captured frames so the longest side is at most this many pixels.
+                0 disables downscaling (keeps full resolution). Default 1920. Disabling uses
+                more disk but skips the resize step entirely.
+              </p>
+            </Field>
+            <Field label="Image format">
+              <div className="flex flex-wrap gap-2">
+                {(["jpeg", "webp"] as const).map((f) => (
+                  <button
+                    key={f}
+                    type="button"
+                    onClick={() => patch({ capture_image_format: f })}
+                    className={
+                      "rounded-md border px-3 py-1.5 text-xs " +
+                      (config.capture_image_format === f
+                        ? "border-accent bg-accent/10 text-accent"
+                        : "border-border text-text-muted hover:text-text")
+                    }
+                  >
+                    {f.toUpperCase()}
+                  </button>
+                ))}
+              </div>
+              <p className="mt-1 text-[11px] text-text-faint">
+                JPEG is usually 2–5× faster to encode than WebP and still produces small files
+                for screenshots. WebP uses lossy encoding for RGB images.
+              </p>
+            </Field>
+            {config.capture_image_format === "jpeg" && (
+              <Field label="JPEG quality (1–100)">
+                <div className="flex items-center gap-3">
+                  <input
+                    type="range"
+                    min={1}
+                    max={100}
+                    value={config.capture_jpeg_quality}
+                    onChange={(e) =>
+                      patch({
+                        capture_jpeg_quality: Math.max(1, Math.min(100, Number(e.target.value) || 85)),
+                      })
+                    }
+                    className="flex-1"
+                  />
+                  <span className="w-8 text-right text-xs text-text-muted">
+                    {config.capture_jpeg_quality}
+                  </span>
+                </div>
+                <p className="mt-1 text-[11px] text-text-faint">
+                  Lower = smaller files and faster encoding. 85 is a good balance for screenshots.
+                </p>
+              </Field>
+            )}
             <Field label="Retention (days, 0 = forever)">
               <input
                 type="number"
@@ -939,6 +1090,324 @@ export default function Settings() {
             </Field>
           </Section>
 
+          <Section title="Video archival">
+            <Field label="Enable video archiving">
+              <label className="flex cursor-pointer items-center gap-2 text-sm text-text">
+                <input
+                  type="checkbox"
+                  checked={config.archive_enabled}
+                  onChange={(e) =>
+                    patch({ archive_enabled: e.target.checked })
+                  }
+                  className="rounded border-border"
+                />
+                <span>Encode captured frames into compressed video segments</span>
+              </label>
+              {config.archive_enabled && archiver && (
+                <div className="mt-1 text-[11px] text-text-muted">
+                  {archiver.running ? (
+                    <span className="text-sky-400">Encoding…</span>
+                  ) : (
+                    <span className="text-green-400">Idle (waiting for next interval)</span>
+                  )}
+                  {" · "}
+                  {(archiver.totalArchived ?? 0).toLocaleString()} frames archived ·{" "}
+                  {(archiver.totalSegments ?? 0).toLocaleString()} segments
+                </div>
+              )}
+              {archiver?.lastError && (
+                <div className="mt-1 text-[11px] text-red-400 break-all">{archiver.lastError}</div>
+              )}
+            </Field>
+            {config.archive_enabled && (
+            <>
+            <Field label="Codec">
+              <div className="space-y-1">
+                {!encoders?.ffmpegFound ? (
+                  <div className="space-y-2">
+                    <p className="text-[11px] text-amber-400">
+                      FFmpeg not found on PATH. Install FFmpeg to enable video archival.
+                    </p>
+                    <button
+                      type="button"
+                      disabled={ffmpegInstallBusy}
+                      onClick={async () => {
+                        setFfmpegInstallBusy(true);
+                        setFfmpegInstallMsg(null);
+                        try {
+                          await api.installFfmpeg();
+                          const addedPath = await api.ensureFfmpegPath();
+                          if (addedPath) {
+                            setFfmpegInstallMsg(`FFmpeg installed and added to PATH (${addedPath}). Restart ScreenRecall to detect it.`);
+                          } else {
+                            setFfmpegInstallMsg("FFmpeg installed. Restart ScreenRecall to detect it.");
+                          }
+                          const e = await api.getEncoderAvailability();
+                          setEncoders(e);
+                        } catch (err) {
+                          setFfmpegInstallMsg(`Install failed: ${String(err)}`);
+                        } finally {
+                          setFfmpegInstallBusy(false);
+                        }
+                      }}
+                      className="rounded-md border border-border px-3 py-1.5 text-xs text-text hover:bg-bg-hover disabled:opacity-50"
+                    >
+                      {ffmpegInstallBusy ? "Installing…" : "Install FFmpeg (winget)"}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        setFfmpegInstallBusy(true);
+                        setFfmpegInstallMsg(null);
+                        try {
+                          const addedPath = await api.ensureFfmpegPath();
+                          if (addedPath) {
+                            setFfmpegInstallMsg(`Added ${addedPath} to PATH. Restart ScreenRecall to detect FFmpeg.`);
+                          } else {
+                            setFfmpegInstallMsg("FFmpeg not found in standard locations. Install it first.");
+                          }
+                          const e = await api.getEncoderAvailability();
+                          setEncoders(e);
+                        } catch (err) {
+                          setFfmpegInstallMsg(`PATH fix failed: ${String(err)}`);
+                        } finally {
+                          setFfmpegInstallBusy(false);
+                        }
+                      }}
+                      className="rounded-md border border-border px-3 py-1.5 text-xs text-text-muted hover:bg-bg-hover disabled:opacity-50"
+                    >
+                      Fix PATH manually
+                    </button>
+                    {ffmpegInstallMsg && (
+                      <p className="text-[11px] text-text-muted">{ffmpegInstallMsg}</p>
+                    )}
+                    <p className="text-[10px] text-text-faint">
+                      Or download manually from{" "}
+                      <a href="https://ffmpeg.org/download.html" target="_blank" rel="noreferrer" className="text-blue-400 underline">
+                        ffmpeg.org
+                      </a>{" "}
+                      and add to PATH.
+                    </p>
+                  </div>
+                ) : (
+                  <>
+                    <select
+                      value={config.archive_codec}
+                      onChange={(e) => patch({ archive_codec: e.target.value })}
+                      className="input"
+                    >
+                      {KNOWN_ENCODER_OPTIONS.map((opt) => {
+                        const available = encoders?.availableEncoders?.includes(opt.ffmpegEncoder) ?? false;
+                        const isRecommended = encoders?.recommended === opt.id;
+                        return (
+                          <option
+                            key={opt.id}
+                            value={opt.id}
+                            disabled={!available && opt.hardwareOnly}
+                          >
+                            {opt.label}
+                            {!available && opt.hardwareOnly ? " (not available)" : ""}
+                            {isRecommended ? " ★ recommended" : ""}
+                          </option>
+                        );
+                      })}
+                    </select>
+                    <p className="text-[10px] text-text-faint">
+                      {encoders.ffmpegVersion} ·{" "}
+                      {(encoders.availableEncoders?.length ?? 0)} encoders detected
+                    </p>
+                    {KNOWN_ENCODER_OPTIONS.some((o) => o.hardwareOnly && !encoders?.availableEncoders?.includes(o.ffmpegEncoder)) && (
+                      <p className="text-[10px] text-text-faint">
+                        Hardware encoders (QSV/NVENC) not detected. Your FFmpeg build may lack oneVPL/CUDA support.
+                        For Intel Arc, install a build with <code className="font-mono">--enable-libvpl</code> (e.g.{" "}
+                        <a href="https://github.com/BtbN/FFmpeg-Builds/releases" target="_blank" rel="noreferrer" className="text-blue-400 underline">
+                          BtbN builds
+                        </a>
+                        ).
+                      </p>
+                    )}
+                  </>
+                )}
+                {ffmpegInstallMsg && (
+                  <p className="text-[11px] text-text-muted">{ffmpegInstallMsg}</p>
+                )}
+                <button
+                  type="button"
+                  onClick={async () => {
+                    console.log("[Settings] Refresh encoder detection clicked");
+                    try {
+                      setFfmpegInstallMsg(null);
+                      const e = await api.refreshEncoderAvailability();
+                      console.log("[Settings] encoder probe result:", e);
+                      setEncoders(e);
+                    } catch (err) {
+                      console.error("[Settings] refreshEncoderAvailability failed:", err);
+                      setFfmpegInstallMsg(`Encoder probe failed: ${String(err)}`);
+                    }
+                  }}
+                  className="rounded-md border border-border px-2 py-1 text-[10px] text-text-muted hover:bg-bg-hover"
+                >
+                  Refresh encoder detection
+                </button>
+              </div>
+            </Field>
+            <Field label="Archive interval (seconds, 0 = disabled)">
+              <input
+                type="number"
+                min={0}
+                max={7200}
+                step={60}
+                value={config.archive_interval_secs}
+                onChange={(e) =>
+                  patch({
+                    archive_interval_secs: Math.max(0, Math.min(7200, Number(e.target.value) || 0)),
+                  })
+                }
+                className="input"
+              />
+              <p className="mt-1 text-[11px] text-text-faint">
+                How often the archiver checks for frames to encode. Frames older than this interval
+                are grouped into video segments.
+              </p>
+            </Field>
+            <Field label="Auto-archive max lookback (seconds)">
+              <input
+                type="number"
+                min={0}
+                max={86400}
+                step={300}
+                value={config.archive_max_lookback_secs}
+                onChange={(e) =>
+                  patch({
+                    archive_max_lookback_secs: Math.max(0, Math.min(86400, Number(e.target.value) || 0)),
+                  })
+                }
+                className="input"
+              />
+              <p className="mt-1 text-[11px] text-text-faint">
+                Safety cap for how far back the automatic archiver looks when catching up after a gap
+                (e.g. weekend shutdown). The archiver normally archives everything since its last
+                successful run. 0 = no cap. Non-zero = limit catch-up to this many seconds.
+              </p>
+            </Field>
+            <Field label="Segment duration (seconds)">
+              <input
+                type="number"
+                min={60}
+                max={3600}
+                step={60}
+                value={config.archive_segment_secs}
+                onChange={(e) =>
+                  patch({
+                    archive_segment_secs: Math.max(60, Math.min(3600, Number(e.target.value) || 900)),
+                  })
+                }
+                className="input"
+              />
+              <p className="mt-1 text-[11px] text-text-faint">
+                Each video file covers this many seconds of screen recording. Shorter segments =
+                faster encoding but more files.
+              </p>
+            </Field>
+            <Field label="Keep source frames after archiving (days)">
+              <input
+                type="number"
+                min={0}
+                max={365}
+                step={1}
+                value={config.archive_keep_frames_days}
+                onChange={(e) =>
+                  patch({
+                    archive_keep_frames_days: Math.max(0, Math.min(365, Number(e.target.value) || 0)),
+                  })
+                }
+                className="input"
+              />
+              <p className="mt-1 text-[11px] text-text-faint">
+                How many days to keep original WebP files after they are archived to video.
+                Set to 0 to keep forever. Frames remain searchable via OCR text and embeddings
+                regardless.
+              </p>
+            </Field>
+            <Field label="Archive history">
+              <button
+                type="button"
+                disabled={!encoders?.ffmpegFound || archiver?.running}
+                onClick={async () => {
+                  if (!confirm("Archive all unarchived frames into video now? This may take several minutes for large histories.")) return;
+                  try {
+                    const [archived, segments, deleted] = await api.archiveHistoryNow();
+                    alert(`Archived ${archived} frames into ${segments} segments. ${deleted} source files deleted.`);
+                  } catch (e) {
+                    alert(`History archive failed: ${String(e)}`);
+                  }
+                }}
+                className="rounded-md border border-border px-3 py-1.5 text-xs text-text hover:bg-bg-hover disabled:opacity-50"
+              >
+                {archiver?.running ? "Archiving…" : "Archive all unarchived history now"}
+              </button>
+              <p className="mt-1 text-[11px] text-text-faint">
+                Runs the archiver immediately on all unarchived frames, regardless of the interval setting.
+              </p>
+            </Field>
+            <Field label="Re-encode existing archives">
+              <div className="flex items-center gap-2">
+                <select
+                  value={config.archive_codec}
+                  onChange={(e) => patch({ archive_codec: e.target.value })}
+                  className="input text-xs"
+                  disabled={transcodeBusy}
+                >
+                  {KNOWN_ENCODER_OPTIONS.map((opt) => {
+                    const available = encoders?.availableEncoders?.includes(opt.ffmpegEncoder) ?? false;
+                    return (
+                      <option
+                        key={opt.id}
+                        value={opt.id}
+                        disabled={!available && opt.hardwareOnly}
+                      >
+                        {opt.label}
+                        {!available && opt.hardwareOnly ? " (not available)" : ""}
+                      </option>
+                    );
+                  })}
+                </select>
+                <button
+                  type="button"
+                  disabled={!encoders?.ffmpegFound || transcodeBusy}
+                  onClick={async () => {
+                    if (!confirm(`Re-encode all archived videos to ${config.archive_codec}? This may take a long time.`)) return;
+                    setTranscodeBusy(true);
+                    setTranscodeProgress(null);
+                    try {
+                      const [success, failed] = await api.transcodeArchives(config.archive_codec);
+                      alert(`Transcode complete: ${success} succeeded, ${failed} failed.`);
+                    } catch (e) {
+                      alert(`Transcode failed: ${String(e)}`);
+                    } finally {
+                      setTranscodeBusy(false);
+                      setTranscodeProgress(null);
+                    }
+                  }}
+                  className="rounded-md border border-border px-3 py-1.5 text-xs text-text hover:bg-bg-hover disabled:opacity-50"
+                >
+                  {transcodeBusy ? "Re-encoding…" : "Re-encode all archives"}
+                </button>
+              </div>
+              {transcodeProgress && (
+                <div className="mt-1 text-[11px] text-text-muted">
+                  Processing {transcodeProgress.current} / {transcodeProgress.total}
+                  {transcodeProgress.file ? ` · ${transcodeProgress.file}` : ""}
+                </div>
+              )}
+              <p className="mt-1 text-[11px] text-text-faint">
+                Re-encodes all existing video segments to the selected codec. Useful when switching to a more efficient codec.
+              </p>
+            </Field>
+            </>
+            )}
+          </Section>
+
           <Section title="App">
             <Field label="Startup">
               <div className="inline-flex items-center gap-2 text-[11px] text-text-muted">
@@ -965,6 +1434,22 @@ export default function Settings() {
                   Launch ScreenRecall when Windows starts
                 </label>
               </div>
+            </Field>
+            <Field label="Restart">
+              <button
+                type="button"
+                onClick={() => {
+                  if (confirm("Restart ScreenRecall?")) {
+                    void api.restartApp();
+                  }
+                }}
+                className="rounded-md border border-border px-3 py-1.5 text-xs text-text hover:bg-bg-hover"
+              >
+                Restart app
+              </button>
+              <p className="mt-1 text-[11px] text-text-faint">
+                Restart to apply config changes or reload encoder detection.
+              </p>
             </Field>
           </Section>
 

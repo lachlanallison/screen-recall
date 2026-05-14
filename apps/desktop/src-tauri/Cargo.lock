@@ -2560,6 +2560,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "jpeg-encoder"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b454d911ac55068f53495488d8ccd0646eaa540c033a28ee15b07838afafb01f"
+
+[[package]]
 name = "js-sys"
 version = "0.3.95"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4763,7 +4769,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "screenrecall"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "active-win-pos-rs",
  "anyhow",
@@ -4774,6 +4780,8 @@ dependencies = [
  "directories",
  "futures-util",
  "image",
+ "jpeg-encoder",
+ "libc",
  "reqwest 0.12.28",
  "rusqlite",
  "rusty-tesseract",

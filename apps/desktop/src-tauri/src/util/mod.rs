@@ -1,4 +1,6 @@
 pub mod active_window;
+pub mod disk;
+pub mod monitor_names;
 pub mod paths;
 pub mod perf_log;
 pub mod process;

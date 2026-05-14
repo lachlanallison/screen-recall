@@ -10,6 +10,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc;
 use tracing::info;
 
+use crate::capture_perf::CapturePerf;
 use crate::config::AppConfig;
 use crate::embed;
 use crate::store::Store;
@@ -55,11 +56,25 @@ pub struct AppState {
     pub managed_llama: AsyncMutex<std::collections::HashMap<String, ManagedLlamaProcess>>,
     /// Last known exit details for managed servers.
     pub managed_llama_last: AsyncMutex<std::collections::HashMap<String, ManagedLlamaLast>>,
-    /// Cached on-disk frames size in MiB; maintained by a background refresher.
-    cached_disk_mb: std::sync::Mutex<f64>,
+    /// Cached on-disk frames size in bytes; maintained by a background refresher.
+    cached_disk_bytes: std::sync::Mutex<u64>,
     /// Cached counts for cheap `get_stats` reads.
     cached_frame_count: std::sync::Mutex<i64>,
     cached_indexed_count: std::sync::Mutex<i64>,
+    /// Cached unarchived frame disk bytes for cheap `get_health_snapshot` reads.
+    cached_unarchived_bytes: std::sync::Mutex<u64>,
+    /// Cached archived frame count for cheap `get_health_snapshot` reads.
+    cached_archived_count: std::sync::Mutex<i64>,
+    /// Cached unarchived frame count for cheap `get_stats` reads.
+    cached_unarchived_count: std::sync::Mutex<i64>,
+    /// Rolling per-phase capture performance samples for Diagnostics.
+    pub capture_perf: std::sync::Arc<CapturePerf>,
+    /// True when the data drive has < 10% free space.
+    disk_warning: AtomicBool,
+    /// True when the data drive has < 5% free space (recording stopped).
+    disk_stopped: AtomicBool,
+    /// Cached free-space percentage (0.0–100.0).
+    disk_free_pct: std::sync::Mutex<f64>,
 }
 
 impl AppState {
@@ -84,9 +99,16 @@ impl AppState {
             worker_activity: std::sync::Arc::new(WorkerActivity::default()),
             managed_llama: AsyncMutex::new(Default::default()),
             managed_llama_last: AsyncMutex::new(Default::default()),
-            cached_disk_mb: std::sync::Mutex::new(0.0),
+            cached_disk_bytes: std::sync::Mutex::new(0),
             cached_frame_count: std::sync::Mutex::new(0),
             cached_indexed_count: std::sync::Mutex::new(0),
+            cached_unarchived_bytes: std::sync::Mutex::new(0),
+            cached_archived_count: std::sync::Mutex::new(0),
+            cached_unarchived_count: std::sync::Mutex::new(0),
+            capture_perf: std::sync::Arc::new(CapturePerf::default()),
+            disk_warning: AtomicBool::new(false),
+            disk_stopped: AtomicBool::new(false),
+            disk_free_pct: std::sync::Mutex::new(100.0),
         })
     }
 
@@ -126,14 +148,14 @@ impl AppState {
         self.config().data_dir.join("frames")
     }
 
-    pub fn set_cached_disk_mb(&self, mb: f64) {
-        if let Ok(mut g) = self.cached_disk_mb.lock() {
-            *g = mb.max(0.0);
+    pub fn set_cached_disk_bytes(&self, bytes: u64) {
+        if let Ok(mut g) = self.cached_disk_bytes.lock() {
+            *g = bytes;
         }
     }
 
-    pub fn cached_disk_mb(&self) -> f64 {
-        self.cached_disk_mb.lock().map(|g| *g).unwrap_or(0.0)
+    pub fn cached_disk_bytes(&self) -> u64 {
+        self.cached_disk_bytes.lock().map(|g| *g).unwrap_or(0)
     }
 
     pub fn set_cached_counts(&self, frame_count: i64, indexed_count: i64) {
@@ -151,6 +173,56 @@ impl AppState {
         (frames, indexed)
     }
 
+    pub fn set_cached_unarchived_bytes(&self, bytes: u64) {
+        if let Ok(mut g) = self.cached_unarchived_bytes.lock() {
+            *g = bytes;
+        }
+    }
+
+    pub fn cached_unarchived_bytes(&self) -> u64 {
+        self.cached_unarchived_bytes.lock().map(|g| *g).unwrap_or(0)
+    }
+
+    pub fn set_cached_archived_count(&self, count: i64) {
+        if let Ok(mut g) = self.cached_archived_count.lock() {
+            *g = count.max(0);
+        }
+    }
+
+    pub fn cached_archived_count(&self) -> i64 {
+        self.cached_archived_count.lock().map(|g| *g).unwrap_or(0)
+    }
+
+    pub fn set_cached_unarchived_count(&self, count: i64) {
+        if let Ok(mut g) = self.cached_unarchived_count.lock() {
+            *g = count.max(0);
+        }
+    }
+
+    pub fn cached_unarchived_count(&self) -> i64 {
+        self.cached_unarchived_count.lock().map(|g| *g).unwrap_or(0)
+    }
+
+    pub fn disk_warning(&self) -> bool {
+        self.disk_warning.load(Ordering::Relaxed)
+    }
+
+    pub fn disk_stopped(&self) -> bool {
+        self.disk_stopped.load(Ordering::Relaxed)
+    }
+
+    pub fn disk_free_pct(&self) -> f64 {
+        self.disk_free_pct.lock().map(|g| *g).unwrap_or(100.0)
+    }
+
+    pub fn set_disk_status(&self, warning: bool, stopped: bool, free_pct: f64) {
+        self.disk_warning.store(warning, Ordering::Relaxed);
+        self.disk_stopped.store(stopped, Ordering::Relaxed);
+        if let Ok(mut g) = self.disk_free_pct.lock() {
+            *g = free_pct.max(0.0).min(100.0);
+        }
+    }
+
     /// Best-effort stop of all managed llama.cpp child processes.
     pub async fn stop_all_managed_llama(&self) -> usize {
         let mut map = self.managed_llama.lock().await;
@@ -166,6 +238,28 @@ impl AppState {
     /// Synchronous wrapper for shutdown hooks that can't be `async`.
     pub fn stop_all_managed_llama_blocking(&self) -> usize {
         tauri::async_runtime::block_on(self.stop_all_managed_llama())
+    }
+}
+
+/// Maximum size for each managed server log file before rotation (10 MB).
+const MANAGED_LOG_MAX_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Rotate a log file if it exceeds the size limit: keep the last N bytes.
+fn rotate_log_if_needed(path: &Path, max_bytes: u64) {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    if let Ok(mut f) = std::fs::OpenOptions::new().read(true).write(true).open(path) {
+        if let Ok(meta) = f.metadata() {
+            if meta.len() > max_bytes {
+                let keep_from = meta.len() - max_bytes;
+                let mut buf = vec![0u8; max_bytes as usize];
+                if f.seek(SeekFrom::Start(keep_from)).is_ok() && f.read_exact(&mut buf).is_ok() {
+                    if f.seek(SeekFrom::Start(0)).is_ok() {
+                        let _ = f.write_all(&buf);
+                        let _ = f.set_len(max_bytes);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -260,6 +354,8 @@ pub fn shell_spawn(
     if let Some(parent) = stderr_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
+    rotate_log_if_needed(stdout_path, MANAGED_LOG_MAX_BYTES);
+    rotate_log_if_needed(stderr_path, MANAGED_LOG_MAX_BYTES);
     let stdout_file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)

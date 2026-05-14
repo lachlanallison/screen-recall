@@ -67,6 +67,37 @@ pub struct AppConfig {
     /// Behavior when clicking the main window close button.
     #[serde(default = "default_close_behavior")]
     pub close_behavior: CloseBehavior,
+
+    /// Whether video archiving is enabled at all.
+    #[serde(default = "default_archive_enabled")]
+    pub archive_enabled: bool,
+    /// FFmpeg encoder preset for video archival (e.g. "h264", "h265", "av1_qsv").
+    #[serde(default = "default_archive_codec")]
+    pub archive_codec: String,
+    /// Seconds between archival runs.
+    #[serde(default = "default_archive_interval_secs")]
+    pub archive_interval_secs: u64,
+    /// Duration of each video segment in seconds.
+    #[serde(default = "default_archive_segment_secs")]
+    pub archive_segment_secs: u64,
+    /// How many days to keep individual frame files after they are archived to video.
+    /// 0 = keep forever. 1 = delete frames archived more than 24 hours ago.
+    #[serde(default = "default_archive_keep_frames_days")]
+    pub archive_keep_frames_days: u64,
+    /// Max lookback in seconds for the automatic archiver. Prevents backfilling
+    /// large history on startup. 0 = unlimited (not recommended).
+    #[serde(default = "default_archive_max_lookback_secs")]
+    pub archive_max_lookback_secs: u64,
+
+    /// Max long edge for stored frames (0 = disable downscaling, keep full resolution).
+    #[serde(default = "default_capture_downscale_max_edge")]
+    pub capture_downscale_max_edge: u32,
+    /// Image format for stored frames.
+    #[serde(default = "default_capture_image_format")]
+    pub capture_image_format: CaptureImageFormat,
+    /// JPEG quality (1–100). Only used when format is JPEG.
+    #[serde(default = "default_capture_jpeg_quality")]
+    pub capture_jpeg_quality: u8,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -82,6 +113,13 @@ pub enum OcrEngineKind {
     Tesseract,
     Native,
     Vision,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CaptureImageFormat {
+    Webp,
+    Jpeg,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -102,6 +140,42 @@ fn default_true() -> bool {
 
 fn default_close_behavior() -> CloseBehavior {
     CloseBehavior::Ask
+}
+
+fn default_archive_enabled() -> bool {
+    true
+}
+
+fn default_archive_codec() -> String {
+    "h264".to_string()
+}
+
+fn default_archive_interval_secs() -> u64 {
+    900 // 15 minutes
+}
+
+fn default_archive_segment_secs() -> u64 {
+    900 // 15 minutes per segment
+}
+
+fn default_archive_keep_frames_days() -> u64 {
+    1 // keep frames for 1 day after archiving by default
+}
+
+fn default_archive_max_lookback_secs() -> u64 {
+    0 // unlimited — archiver catches up from last successful run by default
+}
+
+fn default_capture_downscale_max_edge() -> u32 {
+    1920
+}
+
+fn default_capture_image_format() -> CaptureImageFormat {
+    CaptureImageFormat::Jpeg
+}
+
+fn default_capture_jpeg_quality() -> u8 {
+    85
 }
 
 impl AppConfig {
@@ -131,6 +205,15 @@ impl AppConfig {
             timeline_refresh_secs: default_timeline_refresh_secs(),
             pause_when_workstation_locked: true,
             close_behavior: default_close_behavior(),
+            archive_enabled: default_archive_enabled(),
+            archive_codec: default_archive_codec(),
+            archive_interval_secs: default_archive_interval_secs(),
+            archive_segment_secs: default_archive_segment_secs(),
+            archive_keep_frames_days: default_archive_keep_frames_days(),
+            archive_max_lookback_secs: default_archive_max_lookback_secs(),
+            capture_downscale_max_edge: default_capture_downscale_max_edge(),
+            capture_image_format: default_capture_image_format(),
+            capture_jpeg_quality: default_capture_jpeg_quality(),
         }
     }
 
@@ -138,7 +221,19 @@ impl AppConfig {
         if path.exists() {
             let text = std::fs::read_to_string(path)?;
             match serde_json::from_str::<AppConfig>(&text) {
-                Ok(cfg) => Ok(cfg),
+                Ok(mut cfg) => {
+                    // Migration: older configs may not have archive_enabled.
+                    // If archive_interval_secs was > 0, the user had archiving on.
+                    if !text.contains("archive_enabled") {
+                        cfg.archive_enabled = cfg.archive_interval_secs > 0;
+                    }
+                    // Migration: archive_delete_source (bool) → archive_keep_frames_days (u64).
+                    if text.contains("archive_delete_source") {
+                        // If the old field was true, default to 1 day. If false, 0 (keep forever).
+                        cfg.archive_keep_frames_days = if text.contains("\"archive_delete_source\": true") { 1 } else { 0 };
+                    }
+                    Ok(cfg)
+                }
                 Err(err) => {
                     tracing::warn!(?err, "failed to parse config, using defaults");
                     Ok(AppConfig::default_for(default_data_dir.to_path_buf()))

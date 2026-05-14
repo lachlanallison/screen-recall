@@ -18,6 +18,10 @@ export type Frame = {
   has_embedding: boolean;
   /** Last unix ms this view still matched; duration ≈ static_until_ms - ts. */
   static_until_ms?: number;
+  /** Path to archived video segment (null = still on disk as individual frame file). */
+  video_path: string | null;
+  /** Millisecond offset into video_path where this frame lives. */
+  video_offset_ms: number | null;
 };
 
 export type SearchHit = {
@@ -61,12 +65,34 @@ export type AppConfig = {
   pause_when_workstation_locked: boolean;
   /** Main-window close behavior: ask, minimize-to-tray, or fully quit. */
   close_behavior: "ask" | "minimize" | "quit";
+  /** Whether video archiving is enabled at all. */
+  archive_enabled: boolean;
+  /** FFmpeg encoder preset for video archival (e.g. "h264", "h265", "av1_qsv"). */
+  archive_codec: string;
+  /** Seconds between archival runs. */
+  archive_interval_secs: number;
+  /** Duration of each video segment in seconds. */
+  archive_segment_secs: number;
+  /** How many days to keep individual frame files after archiving (0 = forever). */
+  archive_keep_frames_days: number;
+  /** Max lookback in seconds for the automatic archiver (0 = unlimited). */
+  archive_max_lookback_secs: number;
+  /** Max long edge for stored frames (0 = disable downscaling, keep full resolution). */
+  capture_downscale_max_edge: number;
+  /** Image format for stored frames. */
+  capture_image_format: "jpeg" | "webp";
+  /** JPEG quality (1–100). Only used when format is JPEG. */
+  capture_jpeg_quality: number;
 };
 
 export type Stats = {
-  frame_count: number;
-  disk_mb: number;
-  indexed_count: number;
+  frameCount: number;
+  diskBytes: number;
+  indexedCount: number;
+  daysRecorded: number;
+  unarchivedCount: number;
+  archivedCount: number;
+  pendingDeletionCount: number;
 };
 
 export type OneWorkerQueue = {
@@ -139,6 +165,66 @@ export type HealthSnapshot = {
   sqliteShmMb: number;
   tesseractKnownPath: string | null;
   managedServers: ManagedLlamaStatus[];
+  archivedFrameCount: number;
+  unarchivedFrameDiskBytes: number;
+};
+
+export type EncoderPreset = {
+  id: string;
+  label: string;
+  ffmpegEncoder: string;
+  description: string;
+  compressionRatio: number;
+  hardwareOnly: boolean;
+};
+
+export type EncoderAvailability = {
+  ffmpegFound: boolean;
+  ffmpegVersion: string;
+  availableEncoders: string[];
+  recommended: string;
+};
+
+export type ArchiverStatus = {
+  enabled: boolean;
+  running: boolean;
+  lastRunTs: number | null;
+  lastDurationMs: number | null;
+  totalArchived: number;
+  totalSegments: number;
+  totalSourceDeleted: number;
+  lastError: string | null;
+};
+
+export type PerPhaseStats = {
+  sampleCount: number;
+  capture: StageTimingStats;
+  hash: StageTimingStats;
+  downscale: StageTimingStats;
+  save: StageTimingStats;
+  total: StageTimingStats;
+};
+
+export type MonitorCapturePerf = {
+  monitorId: number;
+  monitorName: string;
+  stats: PerPhaseStats;
+};
+
+export type CapturePerfSnapshot = {
+  overall: PerPhaseStats;
+  byMonitor: MonitorCapturePerf[];
+  /** Stats for frames that were actually saved to disk (excludes skipped/unchanged). */
+  savedOverall: PerPhaseStats;
+  savedByMonitor: MonitorCapturePerf[];
+  lastTickMs: number;
+  lastTickEnumMs: number;
+};
+
+export type DiskStatus = {
+  warning: boolean;
+  stopped: boolean;
+  freePct: number;
 };
 
 /* ------------------------------------------------------------------ */
@@ -188,12 +274,28 @@ export const api = {
   checkDependencies: () => invoke<DependencyReport>("check_dependencies"),
   installTesseract: () => invoke<void>("install_tesseract"),
   installOllama: () => invoke<void>("install_ollama"),
+  installFfmpeg: () => invoke<void>("install_ffmpeg"),
+  ensureFfmpegPath: () => invoke<string>("ensure_ffmpeg_path"),
   pullModel: (model: string) => invoke<void>("pull_model", { model }),
   completeSetup: () => invoke<void>("complete_setup"),
   getStats: () => invoke<Stats>("get_stats"),
   getHealthSnapshot: () => invoke<HealthSnapshot>("get_health_snapshot"),
   getWorkerQueueSnapshot: () =>
     invoke<WorkerQueueSnapshot>("get_worker_queue_snapshot"),
+  getEncoderAvailability: () =>
+    invoke<EncoderAvailability>("get_encoder_availability"),
+  refreshEncoderAvailability: () =>
+    invoke<EncoderAvailability>("refresh_encoder_availability"),
+  getArchiverStatus: () =>
+    invoke<ArchiverStatus>("get_archiver_status"),
+  getCapturePerf: () =>
+    invoke<CapturePerfSnapshot>("get_capture_perf"),
+  getDiskStatus: () =>
+    invoke<DiskStatus>("get_disk_status"),
+  archiveHistoryNow: () =>
+    invoke<[number, number, number]>("archive_history_now"),
+  transcodeArchives: (target_codec: string) =>
+    invoke<[number, number]>("transcode_archives", { targetCodec: target_codec }),
 
   listFrames: (args: { limit: number; beforeTs?: number | null }) =>
     invoke<Frame[]>("list_frames", args),
@@ -223,6 +325,7 @@ export const api = {
   deleteAll: () => invoke<void>("delete_all"),
   windowMinimizeToTray: () => invoke<void>("window_minimize_to_tray"),
   windowQuitApp: () => invoke<void>("window_quit_app"),
+  restartApp: () => invoke<void>("restart_app"),
   getPerfLogTail: (limit = 300) =>
     invoke<string[]>("get_perf_log_tail", { limit }),
   getPerfLogPath: () => invoke<string>("get_perf_log_path"),
