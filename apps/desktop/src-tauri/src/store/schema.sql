@@ -7,12 +7,14 @@ CREATE TABLE IF NOT EXISTS frames (
     app                TEXT,                    -- active process name
     window_title       TEXT,                    -- active window title
     monitor_id         INTEGER NOT NULL,
+    monitor_name       TEXT,                    -- friendly name resolved at capture time
     ocr_done           INTEGER NOT NULL DEFAULT 0,
     embed_done         INTEGER NOT NULL DEFAULT 0,
     static_until_ms    INTEGER NOT NULL,        -- last tick this still matched (>= ts); dedupe extends this
     video_path         TEXT,                    -- path to archived video segment (null = still on disk as frame file)
     video_offset_ms    INTEGER,                 -- ms offset into video_path where this frame lives (null if not archived)
-    archived_at        INTEGER                  -- unix ms when this frame was archived to video (null = not archived)
+    archived_at        INTEGER,                 -- unix ms when this frame was archived to video (null = not archived)
+    source_deleted_at  INTEGER                  -- unix ms when original frame file was deleted after archival
 );
 CREATE INDEX IF NOT EXISTS idx_frames_ts ON frames(ts);
 CREATE INDEX IF NOT EXISTS idx_frames_monitor_id ON frames(monitor_id, id);
@@ -46,3 +48,16 @@ CREATE TABLE IF NOT EXISTS meta (
     value TEXT NOT NULL
 );
 INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', '2');
+
+-- Video segments produced by the archiver (one row per output file).
+CREATE TABLE IF NOT EXISTS videos (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    path         TEXT NOT NULL UNIQUE,
+    start_ts     INTEGER NOT NULL,
+    end_ts       INTEGER NOT NULL,
+    monitor_id   INTEGER NOT NULL,
+    monitor_name TEXT,
+    frame_count  INTEGER NOT NULL,
+    created_at   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_videos_created_at ON videos(created_at);

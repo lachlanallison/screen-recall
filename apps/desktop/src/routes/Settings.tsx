@@ -508,28 +508,6 @@ export default function Settings() {
                 </p>
               </Field>
             )}
-            <Field label="Resize filter (affects OCR quality vs speed)">
-              <div className="flex flex-wrap gap-2">
-                {(["nearest", "lanczos3"] as const).map((f) => (
-                  <button
-                    key={f}
-                    type="button"
-                    onClick={() => patch({ capture_resize_filter: f })}
-                    className={
-                      "rounded-md border px-3 py-1.5 text-xs " +
-                      (config.capture_resize_filter === f
-                        ? "border-accent bg-accent/10 text-accent"
-                        : "border-border text-text-muted hover:text-text")
-                    }
-                  >
-                    {f === "nearest" ? "Nearest (fast)" : "Lanczos3 (sharper)"}
-                  </button>
-                ))}
-              </div>
-              <p className="mt-1 text-[11px] text-text-faint">
-                Nearest is fastest. Lanczos3 produces sharper text for better OCR but is ~5× slower.
-              </p>
-            </Field>
             <Field label="Retention (days, 0 = forever)">
               <input
                 type="number"
@@ -540,6 +518,31 @@ export default function Settings() {
                 }
                 className="input"
               />
+            </Field>
+            <Field label="Deduplication threshold (0 = off, 1–16)">
+              <div className="flex items-center gap-3">
+                <input
+                  type="range"
+                  min={0}
+                  max={16}
+                  step={1}
+                  value={config.capture_dedupe_threshold}
+                  onChange={(e) =>
+                    patch({
+                      capture_dedupe_threshold: Math.max(0, Math.min(16, Number(e.target.value) || 3)),
+                    })
+                  }
+                  className="flex-1"
+                />
+                <span className="w-8 text-right text-xs text-text-muted">
+                  {config.capture_dedupe_threshold}
+                </span>
+              </div>
+              <p className="mt-1 text-[11px] text-text-faint">
+                How many dHash bits must differ for a frame to be saved as new.
+                Default 3 works well for screen captures. Noisy sources (camera
+                feeds, HDMI) may need 6–10. 0 disables deduplication entirely.
+              </p>
             </Field>
             <Field label="Timeline auto-refresh (seconds, 0 = off)">
               <input
@@ -627,6 +630,74 @@ export default function Settings() {
                 </button>
               </div>
             </Field>
+          </Section>
+
+          <Section title="Experimental">
+            <Field label="Adaptive deduplication for noisy camera feeds">
+              <label className="flex cursor-pointer items-center gap-2 text-sm text-text">
+                <input
+                  type="checkbox"
+                  checked={config.capture_adaptive_dedupe_enabled}
+                  onChange={(e) =>
+                    patch({ capture_adaptive_dedupe_enabled: e.target.checked })
+                  }
+                  className="rounded border-border"
+                />
+                <span>
+                  Auto-detect noisy monitors (CCTV / security cameras) and use a
+                  higher dedupe threshold for them only
+                </span>
+              </label>
+              <p className="mt-1 text-[11px] text-text-faint">
+                When enabled, ScreenRecall watches each monitor for the signature
+                of a noisy static feed (medium dHash distances on every tick).
+                Once detected, that monitor switches to the threshold below,
+                leaving your other monitors on the default. When the camera feed
+                is closed the flag clears automatically.
+              </p>
+            </Field>
+            {config.capture_adaptive_dedupe_enabled && (
+              <>
+                <Field label="Noisy monitor threshold (1–16)">
+                  <div className="flex items-center gap-3">
+                    <input
+                      type="range"
+                      min={1}
+                      max={16}
+                      step={1}
+                      value={config.capture_noisy_monitor_threshold}
+                      onChange={(e) =>
+                        patch({
+                          capture_noisy_monitor_threshold: Math.max(
+                            1,
+                            Math.min(16, Number(e.target.value) || 8),
+                          ),
+                        })
+                      }
+                      className="flex-1"
+                    />
+                    <span className="w-8 text-right text-xs text-text-muted">
+                      {config.capture_noisy_monitor_threshold}
+                    </span>
+                  </div>
+                  <p className="mt-1 text-[11px] text-text-faint">
+                    Applied to monitors automatically classified as noisy. Must be
+                    higher than the default deduplication threshold above to have
+                    any effect.
+                  </p>
+                </Field>
+                {config.archive_delay_secs <
+                  config.capture_interval_secs * 20 && (
+                  <div className="rounded border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-200">
+                    <strong>Warning:</strong> Archive delay ({config.archive_delay_secs}s)
+                    is shorter than the adaptive detection window ({" "}
+                    {config.capture_interval_secs * 20}s). The archiver may grab
+                    frames before adaptive dedupe can merge them. Increase Archive
+                    delay or lower Capture interval.
+                  </div>
+                )}
+              </>
+            )}
           </Section>
 
           <Section title="Privacy">
@@ -1267,6 +1338,30 @@ export default function Settings() {
                 </button>
               </div>
             </Field>
+            <Field label="Quality (1–51, lower = better, 0 = encoder default)">
+              <div className="flex items-center gap-3">
+                <input
+                  type="range"
+                  min={0}
+                  max={51}
+                  step={1}
+                  value={config.archive_quality}
+                  onChange={(e) =>
+                    patch({
+                      archive_quality: Math.max(0, Math.min(51, Number(e.target.value) || 18)),
+                    })
+                  }
+                  className="flex-1"
+                />
+                <span className="w-10 text-right text-xs text-text-muted">
+                  {config.archive_quality === 0 ? "auto" : config.archive_quality}
+                </span>
+              </div>
+              <p className="mt-1 text-[11px] text-text-faint">
+                Maps to {knownEncoders.find((e) => e.id === config.archive_codec)?.qualityFlag ?? "crf"} for the selected
+                codec. Lower = higher quality, larger files. 18–22 is a good range for screen content.
+              </p>
+            </Field>
             <Field label="Archive interval (seconds, 0 = disabled)">
               <input
                 type="number"
@@ -1284,6 +1379,28 @@ export default function Settings() {
               <p className="mt-1 text-[11px] text-text-faint">
                 How often the archiver checks for frames to encode. Frames older than this interval
                 are grouped into video segments.
+              </p>
+            </Field>
+            <Field label="Archive delay (seconds)">
+              <input
+                type="number"
+                min={0}
+                max={3600}
+                step={10}
+                value={config.archive_delay_secs}
+                onChange={(e) =>
+                  patch({
+                    archive_delay_secs: Math.max(0, Math.min(3600, Number(e.target.value) || 60)),
+                  })
+                }
+                className="input"
+              />
+              <p className="mt-1 text-[11px] text-text-faint">
+                Frames newer than this are never archived. Default 60s creates a
+                safety buffer so adaptive dedupe can retroactively merge noisy
+                camera frames before they reach the archiver. Lower values
+                archive sooner but increase the chance of orphaned frames in
+                video segments.
               </p>
             </Field>
             <Field label="Auto-archive max lookback (seconds)">

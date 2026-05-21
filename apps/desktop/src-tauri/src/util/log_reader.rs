@@ -4,7 +4,11 @@ use std::path::Path;
 
 /// Read up to `max_lines` from the end of a file, reading at most `max_bytes`
 /// backwards. If the file doesn't exist, returns an empty `Vec`.
-pub fn read_tail_lines(path: &Path, max_lines: usize, max_bytes: u64) -> std::io::Result<Vec<String>> {
+pub fn read_tail_lines(
+    path: &Path,
+    max_lines: usize,
+    max_bytes: u64,
+) -> std::io::Result<Vec<String>> {
     let mut f = File::open(path)?;
     let len = f.metadata()?.len();
     let start = len.saturating_sub(max_bytes.max(1));

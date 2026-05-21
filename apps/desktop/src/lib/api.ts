@@ -12,6 +12,7 @@ export type Frame = {
   app: string | null;
   window_title: string | null;
   monitor_id: number;
+  monitor_name: string | null;
   ocr_done: boolean;
   embed_done: boolean;
   /** True when a row exists in the embeddings table (searchable vector). */
@@ -23,13 +24,26 @@ export type Frame = {
   /** Millisecond offset into video_path where this frame lives. */
   video_offset_ms: number | null;
   /** Unix ms when this frame was archived to video (null = not archived). */
-  archivedAt: number | null;
+  archived_at: number | null;
+  /** Unix ms when the original source image was deleted after archival. */
+  source_deleted_at: number | null;
+};
+
+type WireFrame = Omit<Frame, "archived_at" | "source_deleted_at"> & {
+  archived_at?: number | null;
+  archivedAt?: number | null;
+  source_deleted_at?: number | null;
+  sourceDeletedAt?: number | null;
 };
 
 export type SearchHit = {
   frame: Frame;
   score: number;
   snippet: string | null;
+};
+
+type WireSearchHit = Omit<SearchHit, "frame"> & {
+  frame: WireFrame;
 };
 
 export type EmbeddingPreview = {
@@ -71,6 +85,8 @@ export type AppConfig = {
   archive_enabled: boolean;
   /** FFmpeg encoder preset for video archival (e.g. "h264", "h265", "av1_qsv"). */
   archive_codec: string;
+  /** Quality level for video encoding (1-51, lower=better). 0 = encoder default. */
+  archive_quality: number;
   /** Seconds between archival runs. */
   archive_interval_secs: number;
   /** Duration of each video segment in seconds. */
@@ -85,8 +101,14 @@ export type AppConfig = {
   capture_image_format: "jpeg" | "webp";
   /** JPEG quality (1–100). Only used when format is JPEG. */
   capture_jpeg_quality: number;
-  /** Resize filter for frame downscaling. "nearest" (default, fastest) or "lanczos3" (better OCR accuracy). */
-  capture_resize_filter: "nearest" | "lanczos3";
+  /** dHash Hamming-distance threshold for frame deduplication (0-16). 0 = no dedup. */
+  capture_dedupe_threshold: number;
+  /** When true, auto-detect noisy monitors (e.g. CCTV feeds) and use a higher dedupe threshold for them only. Experimental. */
+  capture_adaptive_dedupe_enabled: boolean;
+  /** dHash threshold applied to monitors classified as noisy by the adaptive detector. */
+  capture_noisy_monitor_threshold: number;
+  /** Safety buffer: frames newer than this many seconds are never archived. Default 60s. */
+  archive_delay_secs: number;
 };
 
 export type Stats = {
@@ -181,6 +203,7 @@ export type EncoderPreset = {
   description: string;
   compressionRatio: number;
   hardwareOnly: boolean;
+  qualityFlag: string;
 };
 
 export type EncoderAvailability = {
@@ -188,6 +211,17 @@ export type EncoderAvailability = {
   ffmpegVersion: string;
   availableEncoders: string[];
   recommended: string;
+};
+
+export type Video = {
+  id: number;
+  path: string;
+  start_ts: number;
+  end_ts: number;
+  monitor_id: number;
+  monitor_name: string | null;
+  frame_count: number;
+  created_at: number;
 };
 
 export type ArchiverStatus = {
@@ -205,8 +239,10 @@ export type ArchiverStatus = {
 export type PerPhaseStats = {
   sampleCount: number;
   capture: StageTimingStats;
+  dhash: StageTimingStats;
   downscale: StageTimingStats;
   save: StageTimingStats;
+  db: StageTimingStats;
   total: StageTimingStats;
 };
 
@@ -214,6 +250,15 @@ export type MonitorCapturePerf = {
   monitorId: number;
   monitorName: string;
   stats: PerPhaseStats;
+};
+
+export type AdaptiveMonitorDiagnostic = {
+  monitorId: number;
+  isNoisy: boolean;
+  tickCount: number;
+  savedTickCount: number;
+  lastDistance: number;
+  mergedFramesCount: number;
 };
 
 export type CapturePerfSnapshot = {
@@ -238,6 +283,14 @@ export type DiskStatus = {
 
 /* Note: Tauri 2 auto-converts JS camelCase keys -> Rust snake_case, so we
    always send camelCase from this file. */
+
+export function normalizeFrame(frame: WireFrame): Frame {
+  return {
+    ...frame,
+    archived_at: frame.archived_at ?? frame.archivedAt ?? null,
+    source_deleted_at: frame.source_deleted_at ?? frame.sourceDeletedAt ?? null,
+  };
+}
 
 export const api = {
   getStatus: () => invoke<{ recording: boolean }>("get_status"),
@@ -297,6 +350,8 @@ export const api = {
     invoke<ArchiverStatus>("get_archiver_status"),
   getCapturePerf: () =>
     invoke<CapturePerfSnapshot>("get_capture_perf"),
+  getAdaptiveState: () =>
+    invoke<AdaptiveMonitorDiagnostic[]>("get_adaptive_state"),
   getDiskStatus: () =>
     invoke<DiskStatus>("get_disk_status"),
   archiveHistoryNow: () =>
@@ -304,8 +359,11 @@ export const api = {
   transcodeArchives: (target_codec: string) =>
     invoke<[number, number]>("transcode_archives", { targetCodec: target_codec }),
 
-  listFrames: (args: { limit: number; beforeTs?: number | null }) =>
-    invoke<Frame[]>("list_frames", args),
+  listFrames: async (args: { limit: number; beforeTs?: number | null }) =>
+    (await invoke<WireFrame[]>("list_frames", args)).map(normalizeFrame),
+
+  listVideos: (args: { limit: number; beforeTs?: number | null }) =>
+    invoke<Video[]>("list_videos", args),
 
   search: (args: {
     query: string;
@@ -313,7 +371,10 @@ export const api = {
     semantic: boolean;
     startTs?: number | null;
     endTs?: number | null;
-  }) => invoke<SearchHit[]>("search", args),
+  }) =>
+    invoke<WireSearchHit[]>("search", args).then((hits) =>
+      hits.map((hit) => ({ ...hit, frame: normalizeFrame(hit.frame) })),
+    ),
 
   chat: (args: {
     prompt: string;

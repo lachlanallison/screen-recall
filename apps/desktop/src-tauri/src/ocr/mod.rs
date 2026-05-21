@@ -129,10 +129,7 @@ fn build_engine(kind: OcrEngineKind) -> Box<dyn OcrEngine> {
     }
 }
 
-pub async fn run_worker(
-    state: SharedState,
-    mut rx: UnboundedReceiver<i64>,
-) -> Result<()> {
+pub async fn run_worker(state: SharedState, mut rx: UnboundedReceiver<i64>) -> Result<()> {
     info!("OCR worker started");
 
     // Process any frames that were already queued from a previous run.

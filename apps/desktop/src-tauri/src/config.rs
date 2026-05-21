@@ -74,6 +74,10 @@ pub struct AppConfig {
     /// FFmpeg encoder preset for video archival (e.g. "h264", "h265", "av1_qsv").
     #[serde(default = "default_archive_codec")]
     pub archive_codec: String,
+    /// Quality level for video encoding (1–51, lower = better). 0 uses encoder default.
+    /// Maps to -crf for software encoders, -global_quality for QSV, -cq for NVENC.
+    #[serde(default = "default_archive_quality")]
+    pub archive_quality: u8,
     /// Seconds between archival runs.
     #[serde(default = "default_archive_interval_secs")]
     pub archive_interval_secs: u64,
@@ -98,9 +102,28 @@ pub struct AppConfig {
     /// JPEG quality (1–100). Only used when format is JPEG.
     #[serde(default = "default_capture_jpeg_quality")]
     pub capture_jpeg_quality: u8,
-    /// Resize filter for frame downscaling. "nearest" (default, fastest) or "lanczos3" (better OCR accuracy).
-    #[serde(default = "default_capture_resize_filter")]
-    pub capture_resize_filter: CaptureResizeFilter,
+    /// dHash Hamming-distance threshold for frame deduplication (0–16).
+    /// 0 disables dedup entirely. 3 (default) is tight for screen captures.
+    /// Noisy sources (camera feeds, HDMI artefacting) may need 6–10.
+    #[serde(default = "default_capture_dedupe_threshold")]
+    pub capture_dedupe_threshold: u32,
+
+    /// When true, auto-detect noisy monitors (e.g. CCTV feeds) and use a
+    /// higher dedupe threshold for them only. Experimental.
+    #[serde(default)]
+    pub capture_adaptive_dedupe_enabled: bool,
+
+    /// dHash threshold applied to monitors classified as noisy by the
+    /// adaptive detector. Must be higher than `capture_dedupe_threshold`
+    /// to have any effect.
+    #[serde(default = "default_capture_noisy_monitor_threshold")]
+    pub capture_noisy_monitor_threshold: u32,
+
+    /// Safety buffer: frames newer than this many seconds are never archived.
+    /// Default 60s protects retroactive adaptive-dedupe merges from colliding
+    /// with the archiver.
+    #[serde(default = "default_archive_delay_secs")]
+    pub archive_delay_secs: u64,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -131,13 +154,6 @@ pub enum CloseBehavior {
     Quit,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum CaptureResizeFilter {
-    Nearest,
-    Lanczos3,
-}
-
 fn default_timeline_refresh_secs() -> u64 {
     5
 }
@@ -156,6 +172,10 @@ fn default_archive_enabled() -> bool {
 
 fn default_archive_codec() -> String {
     "h264".to_string()
+}
+
+fn default_archive_quality() -> u8 {
+    18
 }
 
 fn default_archive_interval_secs() -> u64 {
@@ -186,8 +206,16 @@ fn default_capture_jpeg_quality() -> u8 {
     85
 }
 
-fn default_capture_resize_filter() -> CaptureResizeFilter {
-    CaptureResizeFilter::Nearest
+fn default_capture_dedupe_threshold() -> u32 {
+    3
+}
+
+fn default_capture_noisy_monitor_threshold() -> u32 {
+    8
+}
+
+fn default_archive_delay_secs() -> u64 {
+    60
 }
 
 impl AppConfig {
@@ -219,6 +247,7 @@ impl AppConfig {
             close_behavior: default_close_behavior(),
             archive_enabled: default_archive_enabled(),
             archive_codec: default_archive_codec(),
+            archive_quality: default_archive_quality(),
             archive_interval_secs: default_archive_interval_secs(),
             archive_segment_secs: default_archive_segment_secs(),
             archive_keep_frames_days: default_archive_keep_frames_days(),
@@ -226,7 +255,10 @@ impl AppConfig {
             capture_downscale_max_edge: default_capture_downscale_max_edge(),
             capture_image_format: default_capture_image_format(),
             capture_jpeg_quality: default_capture_jpeg_quality(),
-            capture_resize_filter: default_capture_resize_filter(),
+            capture_dedupe_threshold: default_capture_dedupe_threshold(),
+            capture_adaptive_dedupe_enabled: false,
+            capture_noisy_monitor_threshold: default_capture_noisy_monitor_threshold(),
+            archive_delay_secs: default_archive_delay_secs(),
         }
     }
 
@@ -243,7 +275,12 @@ impl AppConfig {
                     // Migration: archive_delete_source (bool) → archive_keep_frames_days (u64).
                     if text.contains("archive_delete_source") {
                         // If the old field was true, default to 1 day. If false, 0 (keep forever).
-                        cfg.archive_keep_frames_days = if text.contains("\"archive_delete_source\": true") { 1 } else { 0 };
+                        cfg.archive_keep_frames_days =
+                            if text.contains("\"archive_delete_source\": true") {
+                                1
+                            } else {
+                                0
+                            };
                     }
                     Ok(cfg)
                 }

@@ -29,7 +29,9 @@ pub async fn search(
     end_ts: Option<i64>,
 ) -> Result<Vec<SearchHit>> {
     let started = std::time::Instant::now();
-    let fts = state.store.fts_search_range(&fts_query(query), limit as i64, start_ts, end_ts)?;
+    let fts = state
+        .store
+        .fts_search_range(&fts_query(query), limit as i64, start_ts, end_ts)?;
 
     if !semantic {
         perf_log::record(
@@ -101,11 +103,7 @@ pub async fn search(
     }
 }
 
-fn merge(
-    fts: Vec<(Frame, String, f32)>,
-    sem: Vec<(Frame, f32)>,
-    limit: usize,
-) -> Vec<SearchHit> {
+fn merge(fts: Vec<(Frame, String, f32)>, sem: Vec<(Frame, f32)>, limit: usize) -> Vec<SearchHit> {
     use std::collections::HashMap;
 
     // Weighted blend: 0.4 * fts + 0.6 * semantic.

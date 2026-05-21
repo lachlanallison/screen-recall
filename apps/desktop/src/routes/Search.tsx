@@ -5,7 +5,7 @@ import { api, type SearchHit } from "../lib/api";
 import { cn } from "../lib/cn";
 import { openFrameWindow } from "../lib/frameWindow";
 import { staticHeldLabel } from "../lib/staticHeld";
-import { FrameViewer } from "../lib/components/ImageViewer";
+import { FrameThumbnail, FrameViewer } from "../lib/components/ImageViewer";
 import { ContextMenu } from "../lib/components/ContextMenu";
 import { useEscape } from "../lib/components/useEscape";
 
@@ -119,10 +119,8 @@ export default function SearchView() {
             >
               <div className="aspect-video overflow-hidden bg-black/40">
                 <button type="button" onClick={() => setViewer(h)} className="h-full w-full">
-                  <img
-                    src={api.assetUrl(h.frame.path)}
-                    alt=""
-                    loading="lazy"
+                  <FrameThumbnail
+                    frame={h.frame}
                     className="h-full w-full object-cover opacity-90 group-hover:opacity-100"
                   />
                 </button>

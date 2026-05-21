@@ -13,17 +13,16 @@ static APP_STATE: OnceLock<Arc<AppState>> = OnceLock::new();
 pub fn spawn_watcher(state: Arc<AppState>) {
     #[cfg(windows)]
     {
-        if APP_STATE.set(state).is_err() {
-            return;
+        if APP_STATE.set(state).is_ok() {
+            std::thread::Builder::new()
+                .name("screenrecall-wts-lock".into())
+                .spawn(|| {
+                    if let Err(e) = windows_wts_message_loop() {
+                        warn!(?e, "workstation lock watcher exited");
+                    }
+                })
+                .ok();
         }
-        std::thread::Builder::new()
-            .name("screenrecall-wts-lock".into())
-            .spawn(|| {
-                if let Err(e) = windows_wts_message_loop() {
-                    warn!(?e, "workstation lock watcher exited");
-                }
-            })
-            .ok();
     }
     #[cfg(not(windows))]
     {
@@ -102,7 +101,7 @@ fn windows_wts_message_loop() -> Result<(), String> {
     let mut msg = MSG::default();
     loop {
         let r = unsafe { GetMessageW(&mut msg, None, 0, 0) };
-        if r.as_bool() == false {
+        if !r.as_bool() {
             break;
         }
         unsafe {

@@ -10,7 +10,7 @@ import {
   Square,
   Trash2,
 } from "lucide-react";
-import { api, type Frame } from "../lib/api";
+import { api, normalizeFrame, type Frame } from "../lib/api";
 import {
   loadChatState,
   saveChatState,
@@ -18,7 +18,7 @@ import {
   type StoredThread,
 } from "../lib/chatStorage";
 import { openFrameWindow } from "../lib/frameWindow";
-import { FrameViewer } from "../lib/components/ImageViewer";
+import { FrameThumbnail, FrameViewer } from "../lib/components/ImageViewer";
 import { ContextMenu } from "../lib/components/ContextMenu";
 import { useEscape } from "../lib/components/useEscape";
 
@@ -188,7 +188,10 @@ export default function Chat() {
             const clone = [...t.messages];
             const last = clone[clone.length - 1];
             if (!last || last.role !== "assistant") return t;
-            clone[clone.length - 1] = { ...last, citations: evt.payload.frames };
+            clone[clone.length - 1] = {
+              ...last,
+              citations: evt.payload.frames.map(normalizeFrame),
+            };
             return { ...t, messages: clone };
           }),
         );
@@ -606,9 +609,8 @@ export default function Chat() {
                       className="shrink-0 overflow-hidden rounded border border-border hover:border-accent"
                       title={f.window_title ?? f.app ?? ""}
                     >
-                      <img
-                        src={api.assetUrl(f.path)}
-                        alt=""
+                      <FrameThumbnail
+                        frame={f}
                         className="h-24 w-40 object-cover sm:h-28 sm:w-44"
                       />
                     </button>

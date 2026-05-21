@@ -42,7 +42,13 @@ export default function App() {
   const location = useLocation();
   const isFrameWindow = location.pathname === "/frame-window";
   const [recording, setRecording] = useState<boolean>(true);
-  const [setupReady, setSetupReady] = useState<boolean | null>(null);
+  const [setupReady, setSetupReady] = useState<boolean | null>(() => {
+    try {
+      return localStorage.getItem("screenrecall:setup-ready") === "1";
+    } catch {
+      return null;
+    }
+  });
   const [closeBehavior, setCloseBehavior] = useState<
     "ask" | "minimize" | "quit"
   >("ask");
@@ -73,7 +79,11 @@ export default function App() {
           ? true
           : (await api.checkDependencies()).ok;
         if (!cancelled) {
-          setSetupReady(cfg.setup_complete && depsOk);
+          const ready = cfg.setup_complete && depsOk;
+          setSetupReady(ready);
+          try {
+            localStorage.setItem("screenrecall:setup-ready", ready ? "1" : "0");
+          } catch {}
           setCloseBehavior(cfg.close_behavior);
         }
       } catch {
@@ -362,7 +372,14 @@ export default function App() {
               setupReady ? (
                 <Navigate to="/timeline" replace />
               ) : (
-                <FirstRun onComplete={async () => setSetupReady(true)} />
+                <FirstRun
+                  onComplete={async () => {
+                    setSetupReady(true);
+                    try {
+                      localStorage.setItem("screenrecall:setup-ready", "1");
+                    } catch {}
+                  }}
+                />
               )
             }
           />

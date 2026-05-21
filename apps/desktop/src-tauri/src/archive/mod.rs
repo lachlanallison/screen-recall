@@ -31,6 +31,8 @@ pub struct EncoderPreset {
     pub compression_ratio: f32,
     /// Whether this encoder requires hardware support.
     pub hardware_only: bool,
+    /// FFmpeg quality flag name (e.g. "crf", "global_quality", "cq").
+    pub quality_flag: &'static str,
 }
 
 pub const KNOWN_ENCODERS: &[EncoderPreset] = &[
@@ -41,6 +43,7 @@ pub const KNOWN_ENCODERS: &[EncoderPreset] = &[
         description: "Universal compatibility, fast encode",
         compression_ratio: 0.05,
         hardware_only: false,
+        quality_flag: "crf",
     },
     EncoderPreset {
         id: "h264_qsv",
@@ -49,6 +52,7 @@ pub const KNOWN_ENCODERS: &[EncoderPreset] = &[
         description: "Intel hardware encode, very fast",
         compression_ratio: 0.05,
         hardware_only: true,
+        quality_flag: "global_quality",
     },
     EncoderPreset {
         id: "h264_nvenc",
@@ -57,6 +61,7 @@ pub const KNOWN_ENCODERS: &[EncoderPreset] = &[
         description: "NVIDIA hardware encode, very fast",
         compression_ratio: 0.05,
         hardware_only: true,
+        quality_flag: "cq",
     },
     EncoderPreset {
         id: "h265",
@@ -65,6 +70,7 @@ pub const KNOWN_ENCODERS: &[EncoderPreset] = &[
         description: "40-50% smaller than H.264, slower encode",
         compression_ratio: 0.03,
         hardware_only: false,
+        quality_flag: "crf",
     },
     EncoderPreset {
         id: "h265_qsv",
@@ -73,6 +79,7 @@ pub const KNOWN_ENCODERS: &[EncoderPreset] = &[
         description: "Intel hardware HEVC encode",
         compression_ratio: 0.03,
         hardware_only: true,
+        quality_flag: "global_quality",
     },
     EncoderPreset {
         id: "h265_nvenc",
@@ -81,6 +88,7 @@ pub const KNOWN_ENCODERS: &[EncoderPreset] = &[
         description: "NVIDIA hardware HEVC encode",
         compression_ratio: 0.03,
         hardware_only: true,
+        quality_flag: "cq",
     },
     EncoderPreset {
         id: "av1_qsv",
@@ -89,6 +97,7 @@ pub const KNOWN_ENCODERS: &[EncoderPreset] = &[
         description: "Intel Arc hardware AV1, smallest files",
         compression_ratio: 0.02,
         hardware_only: true,
+        quality_flag: "global_quality",
     },
     EncoderPreset {
         id: "av1_nvenc",
@@ -97,6 +106,7 @@ pub const KNOWN_ENCODERS: &[EncoderPreset] = &[
         description: "NVIDIA hardware AV1 encode",
         compression_ratio: 0.02,
         hardware_only: true,
+        quality_flag: "cq",
     },
     EncoderPreset {
         id: "vp9",
@@ -105,6 +115,7 @@ pub const KNOWN_ENCODERS: &[EncoderPreset] = &[
         description: "Google's open codec, good compression",
         compression_ratio: 0.035,
         hardware_only: false,
+        quality_flag: "crf",
     },
 ];
 
@@ -129,16 +140,12 @@ pub fn clear_encoder_cache() {
 
 /// Verify a candidate ffmpeg binary actually runs.
 async fn verify_ffmpeg(path: &str) -> bool {
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        Command::new(path)
-            .arg("-version")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output(),
-    )
-    .await
-    {
+    let mut cmd = Command::new(path);
+    cmd.arg("-version")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    configure_hidden_tokio(&mut cmd);
+    match tokio::time::timeout(std::time::Duration::from_secs(5), cmd.output()).await {
         Ok(Ok(o)) => {
             let stderr = String::from_utf8_lossy(&o.stderr);
             let stdout = String::from_utf8_lossy(&o.stdout);
@@ -150,13 +157,12 @@ async fn verify_ffmpeg(path: &str) -> bool {
 
 #[cfg(target_os = "windows")]
 async fn find_ffmpeg_via_where() -> Option<String> {
-    let output = Command::new("cmd")
-        .args(["/c", "where", "ffmpeg.exe"])
+    let mut cmd = Command::new("cmd");
+    cmd.args(["/c", "where", "ffmpeg.exe"])
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .await
-        .ok()?;
+        .stderr(Stdio::null());
+    configure_hidden_tokio(&mut cmd);
+    let output = cmd.output().await.ok()?;
     if !output.status.success() {
         return None;
     }
@@ -186,15 +192,45 @@ pub async fn find_ffmpeg_binary() -> Option<String> {
         let data_local = directories::BaseDirs::new().map(|d| d.data_local_dir().to_path_buf());
 
         let candidates: Vec<std::path::PathBuf> = vec![
-            data_local.as_ref().map(|d| d.join("Programs").join("Gyan.FFmpeg").join("bin").join("ffmpeg.exe")),
-            data_local.as_ref().map(|d| d.join("Programs").join("FFmpeg").join("bin").join("ffmpeg.exe")),
-            data_local.as_ref().map(|d| d.join("Microsoft").join("WinGet").join("Packages").join("Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe").join("ffmpeg").join("bin").join("ffmpeg.exe")),
-            Some(std::path::PathBuf::from(r"C:\Program Files\ffmpeg\bin\ffmpeg.exe")),
-            Some(std::path::PathBuf::from(r"C:\Program Files (x86)\ffmpeg\bin\ffmpeg.exe")),
+            data_local.as_ref().map(|d| {
+                d.join("Programs")
+                    .join("Gyan.FFmpeg")
+                    .join("bin")
+                    .join("ffmpeg.exe")
+            }),
+            data_local.as_ref().map(|d| {
+                d.join("Programs")
+                    .join("FFmpeg")
+                    .join("bin")
+                    .join("ffmpeg.exe")
+            }),
+            data_local.as_ref().map(|d| {
+                d.join("Microsoft")
+                    .join("WinGet")
+                    .join("Packages")
+                    .join("Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe")
+                    .join("ffmpeg")
+                    .join("bin")
+                    .join("ffmpeg.exe")
+            }),
+            Some(std::path::PathBuf::from(
+                r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
+            )),
+            Some(std::path::PathBuf::from(
+                r"C:\Program Files (x86)\ffmpeg\bin\ffmpeg.exe",
+            )),
             Some(std::path::PathBuf::from(r"C:\ffmpeg\bin\ffmpeg.exe")),
             Some(std::path::PathBuf::from(r"C:\tools\ffmpeg\bin\ffmpeg.exe")),
-            home.as_ref().map(|d| d.join("scoop").join("apps").join("ffmpeg").join("current").join("bin").join("ffmpeg.exe")),
-            home.as_ref().map(|d| d.join("scoop").join("shims").join("ffmpeg.exe")),
+            home.as_ref().map(|d| {
+                d.join("scoop")
+                    .join("apps")
+                    .join("ffmpeg")
+                    .join("current")
+                    .join("bin")
+                    .join("ffmpeg.exe")
+            }),
+            home.as_ref()
+                .map(|d| d.join("scoop").join("shims").join("ffmpeg.exe")),
         ]
         .into_iter()
         .flatten()
@@ -210,10 +246,7 @@ pub async fn find_ffmpeg_binary() -> Option<String> {
 
     #[cfg(target_os = "macos")]
     {
-        for p in [
-            "/opt/homebrew/bin/ffmpeg",
-            "/usr/local/bin/ffmpeg",
-        ] {
+        for p in ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"] {
             if verify_ffmpeg(p).await {
                 return Some(p.into());
             }
@@ -254,18 +287,23 @@ async fn do_probe() -> EncoderAvailability {
     let ffmpeg_path = find_ffmpeg_binary().await;
 
     if let Some(ffmpeg) = &ffmpeg_path {
-        let version_out = Command::new(ffmpeg)
+        let mut version_cmd = Command::new(ffmpeg);
+        version_cmd
             .arg("-version")
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .await;
+            .stderr(Stdio::piped());
+        configure_hidden_tokio(&mut version_cmd);
+        let version_out = version_cmd.output().await;
         if let Ok(o) = version_out {
             let stderr = String::from_utf8_lossy(&o.stderr);
             let stdout = String::from_utf8_lossy(&o.stdout);
             if stderr.contains("ffmpeg version") || stdout.contains("ffmpeg version") {
                 out.ffmpeg_found = true;
-                let text = if stderr.contains("ffmpeg version") { stderr } else { stdout };
+                let text = if stderr.contains("ffmpeg version") {
+                    stderr
+                } else {
+                    stdout
+                };
                 out.ffmpeg_version = text.lines().next().unwrap_or("unknown").to_string();
             }
         }
@@ -276,12 +314,13 @@ async fn do_probe() -> EncoderAvailability {
     }
 
     // List available encoders.
-    let enc_out = Command::new(&ffmpeg_path.unwrap())
+    let mut enc_cmd = Command::new(ffmpeg_path.unwrap());
+    enc_cmd
         .args(["-encoders"])
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await;
+        .stderr(Stdio::piped());
+    configure_hidden_tokio(&mut enc_cmd);
+    let enc_out = enc_cmd.output().await;
     if let Ok(o) = enc_out {
         // Some ffmpeg builds write -encoders to stderr; read both.
         let stdout_text = String::from_utf8_lossy(&o.stdout);
@@ -304,7 +343,14 @@ async fn do_probe() -> EncoderAvailability {
     }
 
     // Pick recommended encoder: prefer hardware AV1 > hardware HEVC > hardware H264 > software H264.
-    let hw_order = ["av1_qsv", "av1_nvenc", "hevc_qsv", "hevc_nvenc", "h264_qsv", "h264_nvenc"];
+    let hw_order = [
+        "av1_qsv",
+        "av1_nvenc",
+        "hevc_qsv",
+        "hevc_nvenc",
+        "h264_qsv",
+        "h264_nvenc",
+    ];
     for enc in &hw_order {
         if out.available_encoders.contains(&enc.to_string()) {
             out.recommended = enc.to_string();
@@ -351,8 +397,26 @@ static ARCHIVER_STATUS: Mutex<ArchiverStatus> = Mutex::new(ArchiverStatus {
     last_error: None,
 });
 
+const ARCHIVE_LAST_SUCCESS_META_KEY: &str = "archive_last_success_ts";
+
 pub fn get_archiver_status() -> ArchiverStatus {
     ARCHIVER_STATUS.lock().unwrap().clone()
+}
+
+pub fn reset_archiver_status() {
+    set_archiver_status(|s| {
+        *s = ArchiverStatus {
+            enabled: false,
+            running: false,
+            last_run_ts: None,
+            last_duration_ms: None,
+            next_run_ts: None,
+            total_archived: 0,
+            total_segments: 0,
+            total_source_deleted: 0,
+            last_error: None,
+        };
+    });
 }
 
 fn set_archiver_status(f: impl FnOnce(&mut ArchiverStatus)) {
@@ -381,7 +445,9 @@ pub async fn run_worker(state: SharedState) -> Result<()> {
                 s.running = false;
             });
             let sleep_secs = cfg.archive_interval_secs.max(60);
-            set_archiver_status(|s| s.next_run_ts = Some(Utc::now().timestamp_millis() + sleep_secs as i64 * 1000));
+            set_archiver_status(|s| {
+                s.next_run_ts = Some(Utc::now().timestamp_millis() + sleep_secs as i64 * 1000)
+            });
             tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
             continue;
         }
@@ -393,8 +459,13 @@ pub async fn run_worker(state: SharedState) -> Result<()> {
         });
 
         let now = Utc::now().timestamp_millis();
-        let status = get_archiver_status();
-        let min_ts = match status.last_run_ts {
+        let delay_ms = cfg.archive_delay_secs as i64 * 1000;
+        let persisted_last_success = state
+            .store
+            .get_meta_i64(ARCHIVE_LAST_SUCCESS_META_KEY)
+            .ok()
+            .flatten();
+        let min_ts = match persisted_last_success {
             Some(ts) => {
                 if cfg.archive_max_lookback_secs > 0 {
                     ts.max(now - (cfg.archive_max_lookback_secs as i64 * 1000))
@@ -402,9 +473,15 @@ pub async fn run_worker(state: SharedState) -> Result<()> {
                     ts
                 }
             }
-            None => now - (cfg.archive_interval_secs as i64 * 1000).max(60_000),
+            None => {
+                if cfg.archive_max_lookback_secs > 0 {
+                    now - (cfg.archive_max_lookback_secs as i64 * 1000).max(60_000)
+                } else {
+                    0
+                }
+            }
         };
-        let cutoff = now - 1000;
+        let cutoff = now - delay_ms;
 
         let started = std::time::Instant::now();
         match archive_segment(&state, cutoff, min_ts, now, &cfg).await {
@@ -417,6 +494,9 @@ pub async fn run_worker(state: SharedState) -> Result<()> {
                     s.total_segments += segments as i64;
                     s.total_source_deleted += deleted as i64;
                 });
+                let _ = state
+                    .store
+                    .set_meta_i64(ARCHIVE_LAST_SUCCESS_META_KEY, cutoff);
                 if archived > 0 {
                     info!(archived, segments, "archiver run complete");
                 }
@@ -426,7 +506,10 @@ pub async fn run_worker(state: SharedState) -> Result<()> {
                         let n = deleted.len();
                         if n > 0 {
                             set_archiver_status(|s| s.total_source_deleted += n as i64);
-                            info!(deleted = n, "deleted archived source files past keep threshold");
+                            info!(
+                                deleted = n,
+                                "deleted archived source files past keep threshold"
+                            );
                         }
                     }
                 }
@@ -441,13 +524,18 @@ pub async fn run_worker(state: SharedState) -> Result<()> {
         }
 
         let sleep_secs = cfg.archive_interval_secs.max(60);
-        set_archiver_status(|s| s.next_run_ts = Some(Utc::now().timestamp_millis() + sleep_secs as i64 * 1000));
+        set_archiver_status(|s| {
+            s.next_run_ts = Some(Utc::now().timestamp_millis() + sleep_secs as i64 * 1000)
+        });
         tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
     }
 }
 
 /// Archive all unarchived frames (backfill / history mode), ignoring the cutoff.
-pub async fn archive_history(state: &SharedState, cfg: &AppConfig) -> Result<(usize, usize, usize)> {
+pub async fn archive_history(
+    state: &SharedState,
+    cfg: &AppConfig,
+) -> Result<(usize, usize, usize)> {
     set_archiver_status(|s| {
         s.enabled = cfg.archive_enabled;
         s.running = true;
@@ -466,6 +554,7 @@ pub async fn archive_history(state: &SharedState, cfg: &AppConfig) -> Result<(us
                 s.total_segments += *segments as i64;
                 s.total_source_deleted += *deleted as i64;
             });
+            let _ = state.store.set_meta_i64(ARCHIVE_LAST_SUCCESS_META_KEY, now);
             info!(archived, segments, "history archive run complete");
         }
         Err(e) => {
@@ -489,7 +578,9 @@ async fn archive_segment(
 ) -> Result<(usize, usize, usize)> {
     // Find monitors that have unarchived frames before cutoff
     // and after min_ts (to avoid backfilling huge history automatically).
-    let monitors = state.store.list_monitors_with_unarchived_range(min_ts, cutoff_ms)?;
+    let monitors = state
+        .store
+        .list_monitors_with_unarchived_range(min_ts, cutoff_ms)?;
     if monitors.is_empty() {
         return Ok((0, 0, 0));
     }
@@ -504,7 +595,9 @@ async fn archive_segment(
     std::fs::create_dir_all(&video_dir)?;
 
     for monitor_id in monitors {
-        let frames = state.store.list_unarchived_for_monitor_range(monitor_id, min_ts, cutoff_ms)?;
+        let frames = state
+            .store
+            .list_unarchived_for_monitor_range(monitor_id, min_ts, cutoff_ms)?;
         if frames.is_empty() {
             continue;
         }
@@ -539,7 +632,7 @@ async fn archive_segment(
             // Build video path: videos/YYYY/MM/DD/HHMMSS_m{monitor}.mp4
             let first_frame_ts = segment[0].1;
             let dt = chrono::DateTime::<Utc>::from_timestamp_millis(first_frame_ts)
-                .unwrap_or_else(|| chrono::Utc::now());
+                .unwrap_or_else(chrono::Utc::now);
             let rel = format!(
                 "{:04}/{:02}/{:02}/{:02}{:02}{:02}_m{}.mp4",
                 dt.year(),
@@ -562,47 +655,40 @@ async fn archive_segment(
             // Cap per-frame duration at 1.0s so the video never plays slower than 1 fps
             // (avoids 2 frames over 15 min => 7.5 min per frame).
             let list_path = video_path.with_extension("txt");
-            let mut list_content = String::new();
-            let avg_frame_duration = (duration_s / segment.len() as f64).min(1.0);
-            for i in 0..segment.len() {
-                let (_, _, frame_path) = &segment[i];
-                let escaped = frame_path.replace("'", "'\\''");
-                list_content.push_str(&format!("file '{}
-", escaped));
-                list_content.push_str(&format!("duration {:.3}
-", avg_frame_duration));
-            }
+            let (list_content, offsets) = build_concat_list_and_offsets(segment, duration_s);
             std::fs::write(&list_path, &list_content)?;
 
             // Run ffmpeg.
             // WebP captures may have alpha (ARGB); force conversion to yuv420p via
             // filter so the output is not black in standard players.
             // JPEG frames are already RGB — skip the filter to avoid unnecessary CPU work.
-            let has_webp = segment.iter().any(|(_, _, path)| {
-                path.to_ascii_lowercase().ends_with(".webp")
-            });
+            let has_webp = segment
+                .iter()
+                .any(|(_, _, path)| path.to_ascii_lowercase().ends_with(".webp"));
             let encoder = &preset.ffmpeg_encoder;
-            let ffmpeg_bin = find_ffmpeg_binary().await
+            let ffmpeg_bin = find_ffmpeg_binary()
+                .await
                 .ok_or_else(|| anyhow!("ffmpeg not found in PATH or common install locations"))?;
             let list_path_str = list_path.to_string_lossy().to_string();
             let video_path_str = video_path.to_string_lossy().to_string();
             let mut cmd = Command::new(&ffmpeg_bin);
-            let mut args: Vec<&str> = vec![
-                "-y",
-                "-f", "concat",
-                "-safe", "0",
-                "-i", &list_path_str,
-            ];
+            let mut args: Vec<&str> =
+                vec!["-y", "-f", "concat", "-safe", "0", "-i", &list_path_str];
             if has_webp {
                 args.push("-vf");
                 args.push("format=yuv420p");
             }
             args.extend_from_slice(&[
-                "-c:v", encoder,
-                "-preset", "veryfast",
-                "-vsync", "vfr",
-                "-pix_fmt", "yuv420p",
+                "-c:v", encoder, "-preset", "veryfast", "-vsync", "vfr", "-pix_fmt", "yuv420p",
             ]);
+            let quality_flag;
+            let quality_val;
+            if cfg.archive_quality > 0 {
+                quality_flag = format!("-{}", preset.quality_flag);
+                quality_val = cfg.archive_quality.to_string();
+                args.push(&quality_flag);
+                args.push(&quality_val);
+            }
             args.push(&video_path_str);
             cmd.args(&args);
             configure_hidden_tokio(&mut cmd);
@@ -623,11 +709,18 @@ async fn archive_segment(
             }
 
             // Update DB: set video_path, video_offset_ms, and archived_at for each frame.
-            let offsets: Vec<(i64, i64)> = segment
-                .iter()
-                .map(|(id, offset_ms, _)| (*id, *offset_ms))
-                .collect();
-            state.store.set_video_archive(&video_path.to_string_lossy(), &offsets, now_ms)?;
+            state
+                .store
+                .set_video_archive(&video_path.to_string_lossy(), &offsets, now_ms)?;
+            let monitor_name = state.store.get_monitor_name(monitor_id).ok().flatten();
+            state.store.insert_video(
+                &video_path.to_string_lossy(),
+                first_ts,
+                last_ts,
+                monitor_id,
+                monitor_name.as_deref(),
+                segment.len() as i64,
+            )?;
 
             total_archived += segment.len();
             total_segments += 1;
@@ -643,6 +736,25 @@ async fn archive_segment(
     Ok((total_archived, total_segments, total_deleted))
 }
 
+fn build_concat_list_and_offsets(
+    segment: &[(i64, i64, String)],
+    duration_s: f64,
+) -> (String, Vec<(i64, i64)>) {
+    let avg_frame_duration_s = (duration_s / segment.len() as f64).min(1.0);
+    let avg_frame_duration_ms = (avg_frame_duration_s * 1000.0).round() as i64;
+    let mut list_content = String::new();
+    let mut offsets: Vec<(i64, i64)> = Vec::with_capacity(segment.len());
+
+    for (i, (frame_id, _, frame_path)) in segment.iter().enumerate() {
+        let escaped = frame_path.replace("'", "'\\''");
+        list_content.push_str(&format!("file '{}'\n", escaped));
+        list_content.push_str(&format!("duration {:.3}\n", avg_frame_duration_s));
+        offsets.push((*frame_id, i as i64 * avg_frame_duration_ms));
+    }
+
+    (list_content, offsets)
+}
+
 /// Re-encode all existing archived video files to a new codec.
 /// Returns (success_count, fail_count).
 pub async fn transcode_all_videos(
@@ -652,6 +764,7 @@ pub async fn transcode_all_videos(
 ) -> Result<(usize, usize)> {
     let preset = find_preset(target_codec)
         .ok_or_else(|| anyhow!("unknown archive codec: {}", target_codec))?;
+    let config = state.config();
 
     let video_paths = state.store.list_archived_video_paths()?;
     let total = video_paths.len();
@@ -659,7 +772,8 @@ pub async fn transcode_all_videos(
         return Ok((0, 0));
     }
 
-    let ffmpeg_bin = find_ffmpeg_binary().await
+    let ffmpeg_bin = find_ffmpeg_binary()
+        .await
         .ok_or_else(|| anyhow!("ffmpeg not found in PATH or common install locations"))?;
 
     let mut success = 0usize;
@@ -686,15 +800,14 @@ pub async fn transcode_all_videos(
         let encoder = &preset.ffmpeg_encoder;
 
         let mut cmd = Command::new(&ffmpeg_bin);
-        cmd.args([
-            "-y",
-            "-i", &video_path.to_string_lossy(),
-            "-c:v", encoder,
-            "-preset", "veryfast",
-            "-pix_fmt", "yuv420p",
-            "-an", // no audio
-            &temp_path.to_string_lossy(),
-        ]);
+        cmd.args(["-y", "-i", &video_path.to_string_lossy()]);
+        cmd.arg("-c:v").arg(encoder);
+        cmd.args(["-preset", "veryfast", "-pix_fmt", "yuv420p"]);
+        if config.archive_quality > 0 {
+            cmd.arg(format!("-{}", preset.quality_flag));
+            cmd.arg(config.archive_quality.to_string());
+        }
+        cmd.args(["-an", &temp_path.to_string_lossy()]);
         configure_hidden_tokio(&mut cmd);
         cmd.stdin(Stdio::null());
         cmd.stdout(Stdio::piped());
@@ -743,4 +856,36 @@ pub async fn transcode_all_videos(
     );
 
     Ok((success, failed))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn concat_offsets_are_video_relative_not_wall_clock_timestamps() {
+        let segment = vec![
+            (10, 1_700_000_000_000, "C:\\frames\\one.jpg".to_string()),
+            (11, 1_700_000_005_000, "C:\\frames\\two.jpg".to_string()),
+            (12, 1_700_000_010_000, "C:\\frames\\three.jpg".to_string()),
+        ];
+
+        let (_list, offsets) = build_concat_list_and_offsets(&segment, 10.0);
+
+        assert_eq!(offsets, vec![(10, 0), (11, 1_000), (12, 2_000)]);
+    }
+
+    #[test]
+    fn concat_list_escapes_single_quotes_and_caps_frame_duration() {
+        let segment = vec![
+            (1, 0, "C:\\frames\\Bob's app.jpg".to_string()),
+            (2, 10_000, "C:\\frames\\next.jpg".to_string()),
+        ];
+
+        let (list, offsets) = build_concat_list_and_offsets(&segment, 10.0);
+
+        assert!(list.contains("file 'C:\\frames\\Bob'\\''s app.jpg'\n"));
+        assert!(list.contains("duration 1.000\n"));
+        assert_eq!(offsets, vec![(1, 0), (2, 1_000)]);
+    }
 }

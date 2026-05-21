@@ -96,8 +96,12 @@ impl Embedder for OllamaEmbedder {
             let snip: String = body.chars().take(768).collect();
             return Err(anyhow!("Ollama /api/embeddings HTTP {}: {}", status, snip));
         }
-        let res: Res = serde_json::from_str(&body)
-            .map_err(|e| anyhow!("Ollama embeddings parse: {e} body: {} ", body.chars().take(200).collect::<String>()))?;
+        let res: Res = serde_json::from_str(&body).map_err(|e| {
+            anyhow!(
+                "Ollama embeddings parse: {e} body: {} ",
+                body.chars().take(200).collect::<String>()
+            )
+        })?;
         if res.embedding.is_empty() {
             return Err(anyhow!("ollama returned empty embedding"));
         }
@@ -145,8 +149,12 @@ impl Embedder for OpenAiEmbedder {
             let snip: String = body.chars().take(768).collect();
             return Err(anyhow!("HTTP {status} for {url}: {snip}"));
         }
-        let res: Res = serde_json::from_str(&body)
-            .map_err(|e| anyhow!("OpenAI /v1/embeddings parse: {e} body: {} ", body.chars().take(200).collect::<String>()))?;
+        let res: Res = serde_json::from_str(&body).map_err(|e| {
+            anyhow!(
+                "OpenAI /v1/embeddings parse: {e} body: {} ",
+                body.chars().take(200).collect::<String>()
+            )
+        })?;
         res.data
             .into_iter()
             .next()
@@ -185,8 +193,12 @@ impl Embedder for OpenAiEmbedder {
             let snip: String = body.chars().take(768).collect();
             return Err(anyhow!("HTTP {status} for {url}: {snip}"));
         }
-        let res: Res = serde_json::from_str(&body)
-            .map_err(|e| anyhow!("OpenAI /v1/embeddings parse: {e} body: {} ", body.chars().take(200).collect::<String>()))?;
+        let res: Res = serde_json::from_str(&body).map_err(|e| {
+            anyhow!(
+                "OpenAI /v1/embeddings parse: {e} body: {} ",
+                body.chars().take(200).collect::<String>()
+            )
+        })?;
         let mut out = vec![None; texts.len()];
         for item in res.data {
             if item.index < out.len() {
@@ -239,8 +251,16 @@ impl Embedder for OpenAiWithOllamaFallback {
             Ok(v) => Ok(v),
             Err(e) => {
                 let msg = e.to_string();
-                if msg.contains("501") || msg.contains("404") || msg.contains("405") || msg.contains("Not Implemented") {
-                    log_ollama_fallback_once(&self.openai.base_url, &self.ollama.base_url, &self.openai.model);
+                if msg.contains("501")
+                    || msg.contains("404")
+                    || msg.contains("405")
+                    || msg.contains("Not Implemented")
+                {
+                    log_ollama_fallback_once(
+                        &self.openai.base_url,
+                        &self.ollama.base_url,
+                        &self.openai.model,
+                    );
                     // Ollama doesn't support batch; fall back to sequential
                     let mut out = Vec::with_capacity(texts.len());
                     for t in texts {
@@ -301,10 +321,7 @@ pub fn build_embedder(cfg: &AppConfig, http: &Client) -> Box<dyn Embedder> {
     })
 }
 
-pub async fn run_worker(
-    state: SharedState,
-    mut rx: UnboundedReceiver<i64>,
-) -> Result<()> {
+pub async fn run_worker(state: SharedState, mut rx: UnboundedReceiver<i64>) -> Result<()> {
     info!("embedding worker started");
     let http = state.http.clone();
 
@@ -404,14 +421,14 @@ async fn flush_pending(state: &SharedState, http: &Client) {
     }
     warn!(
         "flush_pending: stopped after {}×{} frames in one run; will continue on the next tick",
-        EMBED_FLUSH_MAX_ROUNDS,
-        EMBED_FLUSH_BATCH
+        EMBED_FLUSH_MAX_ROUNDS, EMBED_FLUSH_BATCH
     );
 }
 
 /// Process a batch of pending embed frames. Tries batch API call first,
 /// falls back to sequential `process_one` on error.
 async fn flush_batch(state: &SharedState, http: &Client, ids: Vec<i64>) {
+    let started = std::time::Instant::now();
     let mut batch: Vec<(i64, String)> = Vec::new();
     for &id in &ids {
         match state.store.get_ocr_text(id) {
@@ -420,7 +437,13 @@ async fn flush_batch(state: &SharedState, http: &Client, ids: Vec<i64>) {
                 let _ = state.store.set_embed_done_skipped(id);
             }
             Ok(None) => {
-                let ocr_done = state.store.get_frame(id).ok().flatten().map(|f| f.ocr_done).unwrap_or(false);
+                let ocr_done = state
+                    .store
+                    .get_frame(id)
+                    .ok()
+                    .flatten()
+                    .map(|f| f.ocr_done)
+                    .unwrap_or(false);
                 if ocr_done {
                     let _ = state.store.set_embed_done_skipped(id);
                 }
@@ -433,19 +456,84 @@ async fn flush_batch(state: &SharedState, http: &Client, ids: Vec<i64>) {
         return;
     }
 
+    let _active = batch
+        .first()
+        .map(|(id, _)| EmbedActiveGuard::new(&state.worker_activity, *id));
+    let batch_len = batch.len();
+    let total_chars: usize = batch.iter().map(|(_, text)| text.len()).sum();
     let cfg = state.config();
     let embedder = build_embedder(&cfg, http);
     let texts: Vec<&str> = batch.iter().map(|(_, t)| t.as_str()).collect();
 
     match embedder.embed_batch(&texts).await {
         Ok(embeddings) => {
+            let ms = started.elapsed().as_millis() as u64;
+            let per_frame_ms = (ms / batch_len as u64).max(1);
+            let mut saved = 0usize;
+            let mut failed = 0usize;
+            let mut dim: Option<usize> = None;
             for ((id, _text), vec) in batch.into_iter().zip(embeddings) {
+                let vec_dim = vec.len();
+                dim.get_or_insert(vec_dim);
                 if let Err(err) = state.store.set_embedding(id, &vec) {
+                    failed += 1;
                     warn!(frame_id = id, ?err, "save embedding failed");
+                    perf_log::record(
+                        state,
+                        "embed_error",
+                        serde_json::json!({
+                            "frame_id": id,
+                            "ms": per_frame_ms,
+                            "error": err.to_string(),
+                            "batch": true,
+                        }),
+                    );
+                    state.worker_activity.record_embed_ms(per_frame_ms);
+                } else {
+                    saved += 1;
+                    perf_log::record(
+                        state,
+                        "embed_ok",
+                        serde_json::json!({
+                            "frame_id": id,
+                            "dim": vec_dim,
+                            "chars": _text.len(),
+                            "request_chars": _text.len(),
+                            "input_shrinks": 0,
+                            "ms": per_frame_ms,
+                            "batch": true,
+                            "batch_size": batch_len,
+                        }),
+                    );
+                    state.worker_activity.record_embed_ms(per_frame_ms);
                 }
             }
+            perf_log::record(
+                state,
+                "embed_batch_ok",
+                serde_json::json!({
+                    "frames": batch_len,
+                    "saved": saved,
+                    "failed": failed,
+                    "dim": dim,
+                    "chars": total_chars,
+                    "request_chars": total_chars,
+                    "ms": ms,
+                    "per_frame_ms": per_frame_ms,
+                }),
+            );
         }
-        Err(_) => {
+        Err(err) => {
+            perf_log::record(
+                state,
+                "embed_batch_error",
+                serde_json::json!({
+                    "frames": batch_len,
+                    "chars": total_chars,
+                    "ms": started.elapsed().as_millis() as u64,
+                    "error": err.to_string(),
+                }),
+            );
             // Batch failed (e.g. model doesn't support it); fall back to sequential per-frame
             for (id, _text) in batch {
                 process_one(state, http, id).await;
@@ -550,27 +638,39 @@ async fn process_one(state: &SharedState, http: &Client, id: i64) {
             if let Err(err) = state.store.set_embedding(id, &vec) {
                 warn!(frame_id = id, ?err, "save embedding failed");
                 let ms = started.elapsed().as_millis() as u64;
-                perf_log::record(state, "embed_error", serde_json::json!({
-                    "frame_id": id, "ms": ms, "error": err.to_string(),
-                }));
+                perf_log::record(
+                    state,
+                    "embed_error",
+                    serde_json::json!({
+                        "frame_id": id, "ms": ms, "error": err.to_string(),
+                    }),
+                );
                 state.worker_activity.record_embed_ms(ms);
             } else {
                 debug!(frame_id = id, dim = vec.len(), "embedded");
                 let ms = started.elapsed().as_millis() as u64;
-                perf_log::record(state, "embed_ok", serde_json::json!({
-                    "frame_id": id, "dim": vec.len(), "chars": text.len(),
-                    "request_chars": text.len(), "input_shrinks": 0, "ms": ms,
-                }));
+                perf_log::record(
+                    state,
+                    "embed_ok",
+                    serde_json::json!({
+                        "frame_id": id, "dim": vec.len(), "chars": text.len(),
+                        "request_chars": text.len(), "input_shrinks": 0, "ms": ms,
+                    }),
+                );
                 state.worker_activity.record_embed_ms(ms);
             }
         }
         Err(err) => {
             let ms = started.elapsed().as_millis() as u64;
             warn!(frame_id = id, ?err, "embedding call failed");
-            perf_log::record(state, "embed_error", serde_json::json!({
-                "frame_id": id, "ms": ms, "error": err.to_string(),
-                "request_chars": text.len(), "input_shrinks": 0,
-            }));
+            perf_log::record(
+                state,
+                "embed_error",
+                serde_json::json!({
+                    "frame_id": id, "ms": ms, "error": err.to_string(),
+                    "request_chars": text.len(), "input_shrinks": 0,
+                }),
+            );
             state.worker_activity.record_embed_ms(ms);
         }
     }

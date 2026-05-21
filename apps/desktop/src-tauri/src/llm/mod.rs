@@ -187,10 +187,7 @@ impl ChatClient for OpenAiChat {
             choices: Vec<Choice>,
         }
 
-        let url = format!(
-            "{}/chat/completions",
-            self.base_url.trim_end_matches('/')
-        );
+        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let res = self
             .http
             .post(url)
@@ -255,5 +252,3 @@ impl ChatClient for OpenAiChat {
 fn find_double_newline(buf: &[u8]) -> Option<usize> {
     buf.windows(2).position(|w| w == b"\n\n")
 }
-
-

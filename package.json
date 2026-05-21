@@ -7,6 +7,7 @@
   "scripts": {
     "dev": "pnpm --filter desktop tauri dev",
     "build": "pnpm --filter desktop tauri build",
+    "test": "pnpm --filter desktop test && cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml",
     "fmt": "pnpm --filter desktop format"
   }
 }

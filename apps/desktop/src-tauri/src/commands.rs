@@ -4,8 +4,8 @@
 //! Errors are serialized as strings so they can be `.catch()`ed on the JS
 //! side without needing a custom deserialization path.
 
-use std::sync::Arc;
 use std::path::Path;
+use std::sync::Arc;
 
 use futures_util::StreamExt;
 use reqwest::Client;
@@ -21,6 +21,7 @@ use crate::llm::{self, prompts, ChatMessage};
 use crate::search;
 use crate::state::{shell_spawn, AppState, ManagedLlamaLast, ManagedLlamaProcess, OcrQueue};
 use crate::store::Frame;
+use crate::store::Video;
 use crate::util::log_reader;
 use crate::util::paths;
 use crate::util::perf_log;
@@ -184,7 +185,9 @@ async fn managed_status_for_kind(state: &Arc<AppState>, kind: &'static str) -> M
 }
 
 #[tauri::command]
-pub async fn get_managed_llama_status(state: AppStateHandle<'_>) -> CmdResult<Vec<ManagedLlamaStatus>> {
+pub async fn get_managed_llama_status(
+    state: AppStateHandle<'_>,
+) -> CmdResult<Vec<ManagedLlamaStatus>> {
     let shared: Arc<AppState> = state.inner().clone();
     let mut out = Vec::with_capacity(MANAGED_KINDS.len());
     for kind in MANAGED_KINDS {
@@ -208,10 +211,20 @@ pub async fn start_managed_llama(
     let shared: Arc<AppState> = state.inner().clone();
     let mut map = shared.managed_llama.lock().await;
     let mut last_map = shared.managed_llama_last.lock().await;
-    if let Some(existing) = map.get_mut(kind) {
-        if matches!(existing.child.try_wait(), Ok(None)) {
-            return Err(format!("Managed {} server is already running (pid {:?})", kind, existing.child.id()));
+    let remove_existing = match map.get_mut(kind) {
+        Some(existing) => {
+            if matches!(existing.child.try_wait(), Ok(None)) {
+                return Err(format!(
+                    "Managed {} server is already running (pid {:?})",
+                    kind,
+                    existing.child.id()
+                ));
+            }
+            true
         }
+        None => false,
+    };
+    if remove_existing {
         map.remove(kind);
     }
     let log_dir = state.config().data_dir.join("managed-llama");
@@ -221,7 +234,7 @@ pub async fn start_managed_llama(
         &shared,
         "managed_llama_start",
         "custom_command",
-        &[command.clone()],
+        std::slice::from_ref(&command),
         cwd.as_deref(),
     );
     let child = shell_spawn(&command, cwd.as_deref(), &stdout_path, &stderr_path).map_err(err)?;
@@ -300,18 +313,28 @@ pub struct ManagedLlamaStartBothResult {
 }
 
 #[tauri::command]
-pub async fn start_managed_llama_both(state: AppStateHandle<'_>) -> CmdResult<ManagedLlamaStartBothResult> {
+pub async fn start_managed_llama_both(
+    state: AppStateHandle<'_>,
+) -> CmdResult<ManagedLlamaStartBothResult> {
     let cfg = state.config();
     let cwd = cfg.managed_server_working_dir.clone();
     let mut started = Vec::new();
     let mut skipped = Vec::new();
-    if let Some(cmd) = cfg.managed_chat_server_command.clone().filter(|s| !s.trim().is_empty()) {
+    if let Some(cmd) = cfg
+        .managed_chat_server_command
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+    {
         start_managed_llama(state.clone(), "chat".into(), cmd, cwd.clone()).await?;
         started.push("chat".into());
     } else {
         skipped.push("chat".into());
     }
-    if let Some(cmd) = cfg.managed_embed_server_command.clone().filter(|s| !s.trim().is_empty()) {
+    if let Some(cmd) = cfg
+        .managed_embed_server_command
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+    {
         start_managed_llama(state.clone(), "embed".into(), cmd, cwd.clone()).await?;
         started.push("embed".into());
     } else {
@@ -333,7 +356,11 @@ pub fn get_managed_llama_log_tail(
         .unwrap_or("stderr")
         .trim()
         .to_ascii_lowercase();
-    let suffix = if stream == "stdout" { "stdout" } else { "stderr" };
+    let suffix = if stream == "stdout" {
+        "stdout"
+    } else {
+        "stderr"
+    };
     let max = limit.unwrap_or(200).clamp(1, 2000);
     let path = state
         .config()
@@ -523,9 +550,6 @@ pub async fn test_openai_embed_connection(
         "input": "screenrecall connection test",
     });
     let result = run_connection_test(reqwest::Method::POST, &url, Some(body), &api_key, 60).await?;
-    if !result.ok {
-        return Ok(result);
-    }
     Ok(result)
 }
 
@@ -645,11 +669,14 @@ pub async fn check_dependencies(state: AppStateHandle<'_>) -> CmdResult<Dependen
                     // Informational only: wrong names do not block first-run / setup gate.
                     for (key, label, model) in [
                         ("chat_model", "Chat model (Ollama)", cfg.chat_model.clone()),
-                        ("embed_model", "Embedding model (Ollama)", cfg.embed_model.clone()),
+                        (
+                            "embed_model",
+                            "Embedding model (Ollama)",
+                            cfg.embed_model.clone(),
+                        ),
                     ] {
                         let base = model.split(':').next().unwrap_or(&model).to_string();
-                        let present =
-                            names.contains(&model) || names.contains(&base);
+                        let present = names.contains(&model) || names.contains(&base);
                         items.push(DependencyStatus {
                             key: key.into(),
                             label: label.into(),
@@ -899,14 +926,25 @@ pub fn install_ffmpeg(state: AppStateHandle<'_>) -> CmdResult<()> {
         let mut c = std::process::Command::new("brew");
         c.args(["install", "ffmpeg"]);
         let status = c.status().map_err(err)?;
-        if status.success() { Ok(()) } else { Err("brew install ffmpeg failed".into()) }
+        if status.success() {
+            Ok(())
+        } else {
+            Err("brew install ffmpeg failed".into())
+        }
     }
     #[cfg(target_os = "linux")]
     {
         let mut c = std::process::Command::new("sh");
-        c.args(["-c", "sudo apt-get update && sudo apt-get install -y ffmpeg"]);
+        c.args([
+            "-c",
+            "sudo apt-get update && sudo apt-get install -y ffmpeg",
+        ]);
         let status = c.status().map_err(err)?;
-        if status.success() { Ok(()) } else { Err("apt install ffmpeg failed".into()) }
+        if status.success() {
+            Ok(())
+        } else {
+            Err("apt install ffmpeg failed".into())
+        }
     }
 }
 
@@ -922,16 +960,28 @@ pub fn ensure_ffmpeg_path() -> CmdResult<String> {
         // Common locations where winget or manual installs put ffmpeg.
         let base_dirs = directories::BaseDirs::new();
         let candidates = [
-            base_dirs.as_ref().map(|d| d.data_local_dir().join("Programs").join("Gyan.FFmpeg").join("bin")),
-            base_dirs.as_ref().map(|d| d.data_local_dir().join("Programs").join("FFmpeg").join("bin")),
+            base_dirs.as_ref().map(|d| {
+                d.data_local_dir()
+                    .join("Programs")
+                    .join("Gyan.FFmpeg")
+                    .join("bin")
+            }),
+            base_dirs.as_ref().map(|d| {
+                d.data_local_dir()
+                    .join("Programs")
+                    .join("FFmpeg")
+                    .join("bin")
+            }),
             Some(std::path::PathBuf::from(r"C:\Program Files\ffmpeg\bin")),
-            Some(std::path::PathBuf::from(r"C:\Program Files (x86)\ffmpeg\bin")),
+            Some(std::path::PathBuf::from(
+                r"C:\Program Files (x86)\ffmpeg\bin",
+            )),
         ];
 
         for candidate in candidates.into_iter().flatten() {
             if candidate.join("ffmpeg.exe").exists() {
                 let dir_str = candidate.to_string_lossy().to_string();
-                
+
                 // Check if already in PATH
                 let current_path = std::env::var("PATH").unwrap_or_default();
                 if current_path.contains(&dir_str) {
@@ -950,12 +1000,15 @@ pub fn ensure_ffmpeg_path() -> CmdResult<String> {
                 reg_cmd.args([
                     "add",
                     r"HKCU\Environment",
-                    "/v", "Path",
-                    "/t", "REG_EXPAND_SZ",
-                    "/d", &new_path,
+                    "/v",
+                    "Path",
+                    "/t",
+                    "REG_EXPAND_SZ",
+                    "/d",
+                    &new_path,
                     "/f",
                 ]);
-                
+
                 let out = reg_cmd.output().map_err(err)?;
                 if out.status.success() {
                     // Also update the current process PATH so `Command::new("ffmpeg")` works
@@ -1007,6 +1060,38 @@ pub fn complete_setup(state: AppStateHandle<'_>) -> CmdResult<()> {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AdaptiveMonitorDiagnostic {
+    pub monitor_id: i32,
+    pub is_noisy: bool,
+    pub tick_count: usize,
+    pub saved_tick_count: usize,
+    pub last_distance: u32,
+    pub merged_frames_count: u64,
+}
+
+#[tauri::command]
+pub fn get_adaptive_state(state: AppStateHandle<'_>) -> CmdResult<Vec<AdaptiveMonitorDiagnostic>> {
+    let diag = state
+        .inner()
+        .adaptive_diagnostics
+        .read()
+        .map_err(|_| "adaptive diagnostics lock poisoned")?;
+    let out: Vec<AdaptiveMonitorDiagnostic> = diag
+        .iter()
+        .map(|(&monitor_id, info)| AdaptiveMonitorDiagnostic {
+            monitor_id,
+            is_noisy: info.is_noisy,
+            tick_count: info.tick_count,
+            saved_tick_count: info.saved_tick_count,
+            last_distance: info.last_distance,
+            merged_frames_count: info.merged_frames_count,
+        })
+        .collect();
+    Ok(out)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Stats {
     pub frame_count: i64,
     pub disk_bytes: u64,
@@ -1037,8 +1122,14 @@ pub fn get_stats(state: AppStateHandle<'_>) -> CmdResult<Stats> {
             .unwrap_or_default()
             .as_millis() as i64
             - (cfg.archive_keep_frames_days as i64 * 24 * 3600 * 1000);
-        let count = state.store.pending_deletion_frame_count(keep_cutoff).unwrap_or(0);
-        let bytes = state.store.pending_deletion_disk_bytes(keep_cutoff).unwrap_or(0);
+        let count = state
+            .store
+            .pending_deletion_frame_count(keep_cutoff)
+            .unwrap_or(0);
+        let bytes = state
+            .store
+            .pending_deletion_disk_bytes(keep_cutoff)
+            .unwrap_or(0);
         (count, bytes)
     } else {
         (archived, 0)
@@ -1118,10 +1209,16 @@ pub fn list_frames(
 }
 
 #[tauri::command]
-pub fn get_frame_ocr(
+pub fn list_videos(
     state: AppStateHandle<'_>,
-    frame_id: i64,
-) -> CmdResult<Option<String>> {
+    limit: i64,
+    before_ts: Option<i64>,
+) -> CmdResult<Vec<Video>> {
+    state.store.list_videos(limit, before_ts).map_err(err)
+}
+
+#[tauri::command]
+pub fn get_frame_ocr(state: AppStateHandle<'_>, frame_id: i64) -> CmdResult<Option<String>> {
     state.store.get_ocr_text(frame_id).map_err(err)
 }
 
@@ -1148,10 +1245,7 @@ pub fn get_frame_embedding_preview(
 /// Reset OCR (and related embed state) for frames that are still pending OCR or have no stored
 /// text, then queue them for the OCR worker. Returns how many frames were reset.
 #[tauri::command]
-pub fn requeue_ocr_rerun(
-    state: AppStateHandle<'_>,
-    ocr: State<'_, OcrQueue>,
-) -> CmdResult<usize> {
+pub fn requeue_ocr_rerun(state: AppStateHandle<'_>, ocr: State<'_, OcrQueue>) -> CmdResult<usize> {
     let ids = state.store.requeue_ocr_rerun().map_err(err)?;
     let n = ids.len();
     for id in ids {
@@ -1201,7 +1295,8 @@ pub async fn chat(
     let session = session_id.clone();
 
     tauri::async_runtime::spawn(async move {
-        if let Err(err) = run_chat(app.clone(), state, &session, prompt, k, start_ts, end_ts).await {
+        if let Err(err) = run_chat(app.clone(), state, &session, prompt, k, start_ts, end_ts).await
+        {
             let _ = app.emit(
                 "chat:error",
                 serde_json::json!({
@@ -1308,10 +1403,13 @@ async fn run_chat(
         let sid = session_owned.clone();
         tauri::async_runtime::spawn(async move {
             while let Some(delta) = rx.recv().await {
-                let _ = app.emit("chat:delta", serde_json::json!({
-                    "session_id": sid,
-                    "delta": delta,
-                }));
+                let _ = app.emit(
+                    "chat:delta",
+                    serde_json::json!({
+                        "session_id": sid,
+                        "delta": delta,
+                    }),
+                );
             }
         });
     }
@@ -1320,7 +1418,8 @@ async fn run_chat(
     let stream_result = timeout(
         std::time::Duration::from_secs(CHAT_STREAM_TIMEOUT_SECS),
         client.chat_stream(&messages, &tx, &cancel),
-    ).await;
+    )
+    .await;
 
     // Drop tx so the forwarder exits.
     drop(tx);
@@ -1328,25 +1427,40 @@ async fn run_chat(
     match stream_result {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
-            perf_log::record(&state, "chat_error", serde_json::json!({
-                "session_id": session_id, "ms": started.elapsed().as_millis() as u64, "error": e.to_string(),
-            }));
+            perf_log::record(
+                &state,
+                "chat_error",
+                serde_json::json!({
+                    "session_id": session_id, "ms": started.elapsed().as_millis() as u64, "error": e.to_string(),
+                }),
+            );
             return Err(e);
         }
         Err(_) => {
             cancel.notify_waiters();
-            perf_log::record(&state, "chat_timeout", serde_json::json!({
-                "session_id": session_id, "ms": started.elapsed().as_millis() as u64, "timeout_secs": CHAT_STREAM_TIMEOUT_SECS,
-            }));
-            return Err(anyhow::anyhow!("Chat timed out after {}s", CHAT_STREAM_TIMEOUT_SECS));
+            perf_log::record(
+                &state,
+                "chat_timeout",
+                serde_json::json!({
+                    "session_id": session_id, "ms": started.elapsed().as_millis() as u64, "timeout_secs": CHAT_STREAM_TIMEOUT_SECS,
+                }),
+            );
+            return Err(anyhow::anyhow!(
+                "Chat timed out after {}s",
+                CHAT_STREAM_TIMEOUT_SECS
+            ));
         }
     }
 
     let _ = app.emit("chat:done", serde_json::json!({ "session_id": session_id }));
     state.cancelled_sessions.lock().await.remove(session_id);
-    perf_log::record(&state, "chat_ok", serde_json::json!({
-        "session_id": session_id, "ms": started.elapsed().as_millis() as u64, "hits": hits.len(),
-    }));
+    perf_log::record(
+        &state,
+        "chat_ok",
+        serde_json::json!({
+            "session_id": session_id, "ms": started.elapsed().as_millis() as u64, "hits": hits.len(),
+        }),
+    );
     Ok(())
 }
 
@@ -1372,12 +1486,27 @@ pub fn delete_all(state: AppStateHandle<'_>) -> CmdResult<()> {
     // Pause recording while we wipe.
     state.set_recording(false);
 
+    let files = state.store.delete_all_files().unwrap_or_default();
     state.store.delete_all().map_err(err)?;
 
-    // Best-effort: remove the frames directory.
+    for file in files {
+        let _ = std::fs::remove_file(file);
+    }
+
+    // Best-effort: remove generated storage directories.
     let dir = state.frames_dir();
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::create_dir_all(&dir);
+    let video_dir = state.config().data_dir.join("videos");
+    let _ = std::fs::remove_dir_all(&video_dir);
+    let _ = std::fs::create_dir_all(&video_dir);
+
+    state.set_cached_disk_bytes(0);
+    state.set_cached_counts(0, 0);
+    state.set_cached_archived_count(0);
+    state.set_cached_unarchived_count(0);
+    state.set_cached_unarchived_bytes(0);
+    archive::reset_archiver_status();
 
     state.set_recording(true);
     Ok(())
@@ -1404,7 +1533,10 @@ pub fn window_quit_app(state: AppStateHandle<'_>) -> CmdResult<()> {
 }
 
 #[tauri::command]
-pub fn get_perf_log_tail(state: AppStateHandle<'_>, limit: Option<usize>) -> CmdResult<Vec<String>> {
+pub fn get_perf_log_tail(
+    state: AppStateHandle<'_>,
+    limit: Option<usize>,
+) -> CmdResult<Vec<String>> {
     let max = limit.unwrap_or(300).clamp(1, 5000);
     let path = state.config().data_dir.join("perf-events.jsonl");
     match read_tail_lines(&path, max, 384 * 1024) {
@@ -1425,7 +1557,10 @@ pub fn get_perf_log_path(state: AppStateHandle<'_>) -> CmdResult<String> {
 }
 
 #[tauri::command]
-pub fn get_runtime_log_tail(state: AppStateHandle<'_>, limit: Option<usize>) -> CmdResult<Vec<String>> {
+pub fn get_runtime_log_tail(
+    state: AppStateHandle<'_>,
+    limit: Option<usize>,
+) -> CmdResult<Vec<String>> {
     let max = limit.unwrap_or(400).clamp(1, 5000);
     let path = state.config().data_dir.join("runtime.log");
     match read_tail_lines(&path, max, 384 * 1024) {
@@ -1436,7 +1571,10 @@ pub fn get_runtime_log_tail(state: AppStateHandle<'_>, limit: Option<usize>) -> 
 }
 
 #[tauri::command]
-pub fn get_process_log_tail(state: AppStateHandle<'_>, limit: Option<usize>) -> CmdResult<Vec<String>> {
+pub fn get_process_log_tail(
+    state: AppStateHandle<'_>,
+    limit: Option<usize>,
+) -> CmdResult<Vec<String>> {
     let max = limit.unwrap_or(400).clamp(1, 5000);
     let path = state.config().data_dir.join("process-events.jsonl");
     match read_tail_lines(&path, max, 512 * 1024) {
@@ -1478,7 +1616,6 @@ pub fn restart_app() -> CmdResult<()> {
     std::process::exit(0);
 }
 
-
 #[tauri::command]
 pub fn get_launch_on_startup_status(state: AppStateHandle<'_>) -> CmdResult<LaunchOnStartupStatus> {
     #[cfg(target_os = "windows")]
@@ -1506,7 +1643,7 @@ pub fn get_launch_on_startup_status(state: AppStateHandle<'_>) -> CmdResult<Laun
             .map_err(err)?;
         let enabled = out.status.success();
         let detail = String::from_utf8_lossy(&out.stdout).to_string();
-        return Ok(LaunchOnStartupStatus { enabled, detail });
+        Ok(LaunchOnStartupStatus { enabled, detail })
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -1518,7 +1655,10 @@ pub fn get_launch_on_startup_status(state: AppStateHandle<'_>) -> CmdResult<Laun
 }
 
 #[tauri::command]
-pub fn set_launch_on_startup(state: AppStateHandle<'_>, enabled: bool) -> CmdResult<LaunchOnStartupStatus> {
+pub fn set_launch_on_startup(
+    state: AppStateHandle<'_>,
+    enabled: bool,
+) -> CmdResult<LaunchOnStartupStatus> {
     #[cfg(target_os = "windows")]
     {
         if enabled {
@@ -1594,13 +1734,17 @@ pub fn set_launch_on_startup(state: AppStateHandle<'_>, enabled: bool) -> CmdRes
             if !stderr.to_ascii_lowercase().contains("unable to find")
                 && !stdout.to_ascii_lowercase().contains("unable to find")
             {
-                return Err(if stderr.trim().is_empty() { stdout } else { stderr });
+                return Err(if stderr.trim().is_empty() {
+                    stdout
+                } else {
+                    stderr
+                });
             }
         }
-        return Ok(LaunchOnStartupStatus {
+        Ok(LaunchOnStartupStatus {
             enabled: false,
             detail: "Disabled".into(),
-        });
+        })
     }
     #[cfg(not(target_os = "windows"))]
     {

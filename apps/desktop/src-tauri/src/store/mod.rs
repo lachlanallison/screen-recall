@@ -21,6 +21,7 @@ pub struct Frame {
     pub app: Option<String>,
     pub window_title: Option<String>,
     pub monitor_id: i32,
+    pub monitor_name: Option<String>,
     pub ocr_done: bool,
     pub embed_done: bool,
     /// `true` when a row exists in `embeddings` (actual vector stored).
@@ -33,10 +34,13 @@ pub struct Frame {
     pub video_offset_ms: Option<i64>,
     /// Unix ms when this frame was archived to video (null = not archived).
     pub archived_at: Option<i64>,
+    /// Unix ms when the original source image was deleted after archival.
+    pub source_deleted_at: Option<i64>,
 }
 
 pub struct Store {
     conn: Mutex<Connection>,
+    conn_writer: Mutex<Connection>,
 }
 
 impl Store {
@@ -50,6 +54,8 @@ impl Store {
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=NORMAL;
              PRAGMA foreign_keys=ON;
+             PRAGMA busy_timeout=5000;
+             PRAGMA wal_autocheckpoint=0;
              PRAGMA temp_store=MEMORY;
               -- Embedding blobs make the DB file huge;SQLite's default mmap can map GBs → RSS blows up.
               PRAGMA mmap_size=134217728;
@@ -59,14 +65,36 @@ impl Store {
         conn.execute_batch(SCHEMA)?;
         migrate_frames_static_until(&conn)?;
         migrate_frames_video_columns(&conn)?;
+        migrate_frames_monitor_name(&conn)?;
         backfill_embed_done_for_empty_ocr(&conn)?;
         migrate_archived_at(&conn)?;
+        migrate_source_deleted_at(&conn)?;
         migrate_unarchived_index(&conn)?;
+        migrate_videos_table(&conn)?;
+        backfill_videos(&conn)?;
+
+        // Second connection for writes so read-heavy hot path (fingerprint lookups)
+        // doesn't contend with inserts from parallel monitor threads. WAL mode
+        // allows concurrent readers even while a writer is writing.
+        let conn_writer = Connection::open(path).context("open sqlite writer")?;
+        conn_writer.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA synchronous=NORMAL;
+             PRAGMA foreign_keys=ON;
+             PRAGMA busy_timeout=5000;
+             PRAGMA wal_autocheckpoint=0;
+             PRAGMA temp_store=MEMORY;
+             PRAGMA mmap_size=134217728;
+             PRAGMA cache_size=-8192;",
+        )?;
+
         Ok(Self {
             conn: Mutex::new(conn),
+            conn_writer: Mutex::new(conn_writer),
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn insert_frame(
         &self,
         ts: i64,
@@ -75,21 +103,19 @@ impl Store {
         app: Option<&str>,
         window_title: Option<&str>,
         monitor_id: i32,
+        monitor_name: Option<&str>,
     ) -> Result<i64> {
-        let guard = self.conn.lock().unwrap();
+        let guard = self.conn_writer.lock().unwrap();
         guard.execute(
-            "INSERT INTO frames(ts, path, phash, app, window_title, monitor_id, ocr_done, embed_done, static_until_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 0, ?7)",
-            params![ts, path, phash as i64, app, window_title, monitor_id, ts],
+            "INSERT INTO frames(ts, path, phash, app, window_title, monitor_id, monitor_name, ocr_done, embed_done, static_until_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 0, ?8)",
+            params![ts, path, phash as i64, app, window_title, monitor_id, monitor_name, ts],
         )?;
         Ok(guard.last_insert_rowid())
     }
 
     /// Latest stored frame for a monitor: `(id, phash)`.
-    pub fn last_frame_fingerprint(
-        &self,
-        monitor_id: i32,
-    ) -> Result<Option<(i64, u64)>> {
+    pub fn last_frame_fingerprint(&self, monitor_id: i32) -> Result<Option<(i64, u64)>> {
         let guard = self.conn.lock().unwrap();
         let row = guard
             .query_row(
@@ -106,22 +132,78 @@ impl Store {
     }
 
     /// When a new capture is deduped (same dHash as last), extend how long the prior frame stayed.
-    pub fn extend_frame_static_until(&self, frame_id: i64, until_ms: i64) -> Result<()> {
-        let guard = self.conn.lock().unwrap();
-        guard.execute(
+    pub fn extend_frame_static_until(&self, frame_id: i64, until_ms: i64) -> Result<bool> {
+        let guard = self.conn_writer.lock().unwrap();
+        let changed = guard.execute(
             "UPDATE frames SET static_until_ms = MAX(COALESCE(static_until_ms, ts), ?1) WHERE id = ?2",
             params![until_ms, frame_id],
         )?;
-        Ok(())
+        Ok(changed > 0)
+    }
+
+    /// Recent unarchived frames for a monitor (with phash), ordered by timestamp.
+    /// Only returns frames where embedding is done so OCR text is available.
+    pub fn recent_unarchived_fingerprints(
+        &self,
+        monitor_id: i32,
+        before_ts: i64,
+        limit: i64,
+    ) -> Result<Vec<(i64, i64, String, u64)>> {
+        let guard = self.conn.lock().unwrap();
+        let mut stmt = guard.prepare(
+            "SELECT id, ts, path, phash FROM frames
+             WHERE monitor_id = ?1
+               AND video_path IS NULL
+               AND embed_done = 1
+               AND ts < ?2
+             ORDER BY ts ASC
+             LIMIT ?3",
+        )?;
+        let rows = stmt
+            .query_map(params![monitor_id, before_ts, limit], |row| {
+                let id: i64 = row.get(0)?;
+                let ts: i64 = row.get(1)?;
+                let path: String = row.get(2)?;
+                let p: i64 = row.get(3)?;
+                Ok((id, ts, path, p as u64))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Retroactively merge noisy frames: delete redundant rows + files and extend
+    /// the keeper's static-until to cover the merged span.
+    pub fn merge_noisy_frames(
+        &self,
+        keeper_id: i64,
+        delete_ids: &[i64],
+        new_static_until: i64,
+    ) -> Result<usize> {
+        if delete_ids.is_empty() {
+            return Ok(0);
+        }
+        let guard = self.conn_writer.lock().unwrap();
+        let tx = guard.unchecked_transaction()?;
+        for id in delete_ids {
+            tx.execute("DELETE FROM embeddings WHERE frame_id = ?1", params![id])?;
+            tx.execute("DELETE FROM ocr_text WHERE frame_id = ?1", params![id])?;
+            tx.execute("DELETE FROM frames WHERE id = ?1", params![id])?;
+        }
+        tx.execute(
+            "UPDATE frames SET static_until_ms = MAX(COALESCE(static_until_ms, ts), ?1) WHERE id = ?2",
+            params![new_static_until, keeper_id],
+        )?;
+        tx.commit()?;
+        Ok(delete_ids.len())
     }
 
     pub fn list_frames(&self, limit: i64, before_ts: Option<i64>) -> Result<Vec<Frame>> {
         let guard = self.conn.lock().unwrap();
         let mut stmt = guard.prepare(
-            "SELECT f.id, f.ts, f.path, f.app, f.window_title, f.monitor_id, f.ocr_done, f.embed_done,
+            "SELECT f.id, f.ts, f.path, f.app, f.window_title, f.monitor_id, f.monitor_name, f.ocr_done, f.embed_done,
                     COALESCE(f.static_until_ms, f.ts) AS static_until_ms,
                     EXISTS(SELECT 1 FROM embeddings e WHERE e.frame_id = f.id) AS has_embedding,
-                    f.video_path, f.video_offset_ms, f.archived_at
+                    f.video_path, f.video_offset_ms, f.archived_at, f.source_deleted_at
              FROM frames f
              WHERE (?1 IS NULL OR f.ts < ?1)
              ORDER BY f.ts DESC
@@ -137,10 +219,10 @@ impl Store {
         let guard = self.conn.lock().unwrap();
         let f = guard
             .query_row(
-                "SELECT f.id, f.ts, f.path, f.app, f.window_title, f.monitor_id, f.ocr_done, f.embed_done,
+                "SELECT f.id, f.ts, f.path, f.app, f.window_title, f.monitor_id, f.monitor_name, f.ocr_done, f.embed_done,
                         COALESCE(f.static_until_ms, f.ts) AS static_until_ms,
                         EXISTS(SELECT 1 FROM embeddings e WHERE e.frame_id = f.id) AS has_embedding,
-                        f.video_path, f.video_offset_ms, f.archived_at
+                        f.video_path, f.video_offset_ms, f.archived_at, f.source_deleted_at
                  FROM frames f WHERE f.id = ?1",
                 params![id],
                 row_to_frame,
@@ -230,17 +312,18 @@ impl Store {
     ) -> Result<Vec<(Frame, String, f32)>> {
         let guard = self.conn.lock().unwrap();
         let mut sql = String::from(
-            "SELECT f.id, f.ts, f.path, f.app, f.window_title, f.monitor_id, f.ocr_done, f.embed_done,
+            "SELECT f.id, f.ts, f.path, f.app, f.window_title, f.monitor_id, f.monitor_name, f.ocr_done, f.embed_done,
                     COALESCE(f.static_until_ms, f.ts) AS s_until,
                     EXISTS(SELECT 1 FROM embeddings e WHERE e.frame_id = f.id) AS has_embedding,
-                    f.video_path, f.video_offset_ms, f.archived_at,
+                    f.video_path, f.video_offset_ms, f.archived_at, f.source_deleted_at,
                     snippet(ocr_text, 0, '<<', '>>', '…', 16) AS snip,
                     bm25(ocr_text) AS score
              FROM ocr_text
              JOIN frames f ON f.id = ocr_text.frame_id
              WHERE ocr_text.text MATCH ?1",
         );
-        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(query.to_string())];
+        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> =
+            vec![Box::new(query.to_string())];
         if let Some(ts) = start_ts {
             sql.push_str(" AND f.ts >= ?");
             param_values.push(Box::new(ts));
@@ -252,12 +335,13 @@ impl Store {
         sql.push_str(" ORDER BY score ASC LIMIT ?");
         param_values.push(Box::new(limit));
 
-        let params_ref: Vec<&dyn rusqlite::types::ToSql> = param_values.iter().map(|p| p.as_ref()).collect();
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+            param_values.iter().map(|p| p.as_ref()).collect();
         let mut stmt = guard.prepare(&sql)?;
         let rows = stmt
             .query_map(params_ref.as_slice(), |row| {
-                let static_until_ms: i64 = row.get(8)?;
-                let has_embedding: i32 = row.get(9)?;
+                let static_until_ms: i64 = row.get(9)?;
+                let has_embedding: i32 = row.get(10)?;
                 let frame = Frame {
                     id: row.get(0)?,
                     ts: row.get(1)?,
@@ -265,16 +349,18 @@ impl Store {
                     app: row.get(3)?,
                     window_title: row.get(4)?,
                     monitor_id: row.get(5)?,
-                    ocr_done: row.get::<_, i32>(6)? != 0,
-                    embed_done: row.get::<_, i32>(7)? != 0,
+                    monitor_name: row.get(6)?,
+                    ocr_done: row.get::<_, i32>(7)? != 0,
+                    embed_done: row.get::<_, i32>(8)? != 0,
                     has_embedding: has_embedding != 0,
                     static_until_ms,
-                    video_path: row.get(10)?,
-                    video_offset_ms: row.get(11)?,
-                    archived_at: row.get(12)?,
+                    video_path: row.get(11)?,
+                    video_offset_ms: row.get(12)?,
+                    archived_at: row.get(13)?,
+                    source_deleted_at: row.get(14)?,
                 };
-                let snippet: String = row.get(13)?;
-                let raw: f64 = row.get(14)?;
+                let snippet: String = row.get(15)?;
+                let raw: f64 = row.get(16)?;
                 let score = 1.0 / (1.0 + (raw.abs() as f32));
                 Ok((frame, snippet, score))
             })?
@@ -306,11 +392,7 @@ impl Store {
     /// Walk embeddings and compute cosine similarity with `query`.
     /// Scans at most `SEMANTIC_SCAN_CAP` recent indexed frames to avoid unbounded memory
     /// on large DBs. Returns top-`limit` frames with scores.
-    pub fn semantic_search(
-        &self,
-        query: &[f32],
-        limit: usize,
-    ) -> Result<Vec<(Frame, f32)>> {
+    pub fn semantic_search(&self, query: &[f32], limit: usize) -> Result<Vec<(Frame, f32)>> {
         self.semantic_search_range(query, limit, None, None)
     }
 
@@ -331,9 +413,9 @@ impl Store {
 
         let guard = self.conn.lock().unwrap();
         let mut sql = String::from(
-            "SELECT f.id, f.ts, f.path, f.app, f.window_title, f.monitor_id, f.ocr_done, f.embed_done,
+            "SELECT f.id, f.ts, f.path, f.app, f.window_title, f.monitor_id, f.monitor_name, f.ocr_done, f.embed_done,
                     COALESCE(f.static_until_ms, f.ts) AS s_until,
-                    f.video_path, f.video_offset_ms, f.archived_at,
+                    f.video_path, f.video_offset_ms, f.archived_at, f.source_deleted_at,
                     e.dim, e.vector
              FROM embeddings e
              JOIN frames f ON f.id = e.frame_id
@@ -351,10 +433,11 @@ impl Store {
         sql.push_str(" ORDER BY f.ts DESC LIMIT ?");
         param_values.push(Box::new(Self::SEMANTIC_SCAN_CAP));
 
-        let params_ref: Vec<&dyn rusqlite::types::ToSql> = param_values.iter().map(|p| p.as_ref()).collect();
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+            param_values.iter().map(|p| p.as_ref()).collect();
         let mut stmt = guard.prepare(&sql)?;
         let rows = stmt.query_map(params_ref.as_slice(), |row| {
-            let static_until_ms: i64 = row.get(8)?;
+            let static_until_ms: i64 = row.get(9)?;
             let frame = Frame {
                 id: row.get(0)?,
                 ts: row.get(1)?,
@@ -362,16 +445,18 @@ impl Store {
                 app: row.get(3)?,
                 window_title: row.get(4)?,
                 monitor_id: row.get(5)?,
-                ocr_done: row.get::<_, i32>(6)? != 0,
-                embed_done: row.get::<_, i32>(7)? != 0,
+                monitor_name: row.get(6)?,
+                ocr_done: row.get::<_, i32>(7)? != 0,
+                embed_done: row.get::<_, i32>(8)? != 0,
                 has_embedding: true,
                 static_until_ms,
-                video_path: row.get(9)?,
-                video_offset_ms: row.get(10)?,
-                archived_at: row.get(11)?,
+                video_path: row.get(10)?,
+                video_offset_ms: row.get(11)?,
+                archived_at: row.get(12)?,
+                source_deleted_at: row.get(13)?,
             };
-            let dim: i64 = row.get(12)?;
-            let blob: Vec<u8> = row.get(13)?;
+            let dim: i64 = row.get(14)?;
+            let blob: Vec<u8> = row.get(15)?;
             Ok((frame, dim, blob))
         })?;
 
@@ -495,7 +580,10 @@ impl Store {
             .collect::<Result<Vec<_>, _>>()?;
         drop(stmt);
         for id in &ids {
-            guard.execute("UPDATE frames SET embed_done = 0 WHERE id = ?1", params![id])?;
+            guard.execute(
+                "UPDATE frames SET embed_done = 0 WHERE id = ?1",
+                params![id],
+            )?;
         }
         Ok(ids)
     }
@@ -503,11 +591,10 @@ impl Store {
     /// Count of frames still waiting for OCR (`ocr_done = 0`).
     pub fn count_pending_ocr(&self) -> Result<i64> {
         let guard = self.conn.lock().unwrap();
-        let n: i64 = guard.query_row(
-            "SELECT COUNT(*) FROM frames WHERE ocr_done = 0",
-            [],
-            |r| r.get(0),
-        )?;
+        let n: i64 =
+            guard.query_row("SELECT COUNT(*) FROM frames WHERE ocr_done = 0", [], |r| {
+                r.get(0)
+            })?;
         Ok(n)
     }
 
@@ -524,8 +611,7 @@ impl Store {
 
     pub fn stats(&self) -> Result<(i64, i64)> {
         let guard = self.conn.lock().unwrap();
-        let frames: i64 =
-            guard.query_row("SELECT COUNT(*) FROM frames", [], |r| r.get(0))?;
+        let frames: i64 = guard.query_row("SELECT COUNT(*) FROM frames", [], |r| r.get(0))?;
         let indexed: i64 = guard.query_row(
             "SELECT COUNT(*) FROM frames WHERE embed_done = 1",
             [],
@@ -577,16 +663,98 @@ impl Store {
     pub fn delete_expired_source_files(&self, before_archived_at_ms: i64) -> Result<Vec<String>> {
         let guard = self.conn.lock().unwrap();
         let mut stmt = guard.prepare(
-            "SELECT path FROM frames WHERE archived_at IS NOT NULL AND archived_at < ?1",
+            "SELECT id, path FROM frames
+             WHERE archived_at IS NOT NULL
+               AND archived_at < ?1
+               AND source_deleted_at IS NULL",
         )?;
-        let paths: Vec<String> = stmt
-            .query_map(params![before_archived_at_ms], |row| row.get(0))?
+        let rows: Vec<(i64, String)> = stmt
+            .query_map(params![before_archived_at_ms], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?
             .collect::<Result<Vec<_>, _>>()?;
         drop(stmt);
-        for p in &paths {
-            let _ = std::fs::remove_file(p);
+        let mut deleted = Vec::new();
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let tx = guard.unchecked_transaction()?;
+        for (id, p) in &rows {
+            match std::fs::remove_file(p) {
+                Ok(()) => {
+                    tx.execute(
+                        "UPDATE frames SET source_deleted_at = ?1 WHERE id = ?2",
+                        params![now_ms, id],
+                    )?;
+                    deleted.push(p.clone());
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    tx.execute(
+                        "UPDATE frames SET source_deleted_at = ?1 WHERE id = ?2",
+                        params![now_ms, id],
+                    )?;
+                }
+                Err(_) => {}
+            }
+        }
+        tx.commit()?;
+        Ok(deleted)
+    }
+
+    pub fn get_meta_i64(&self, key: &str) -> Result<Option<i64>> {
+        let guard = self.conn.lock().unwrap();
+        let value = guard
+            .query_row("SELECT value FROM meta WHERE key = ?1", params![key], |r| {
+                r.get::<_, String>(0)
+            })
+            .optional()?;
+        Ok(value.and_then(|s| s.parse::<i64>().ok()))
+    }
+
+    pub fn set_meta_i64(&self, key: &str, value: i64) -> Result<()> {
+        let guard = self.conn.lock().unwrap();
+        guard.execute(
+            "INSERT INTO meta(key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value.to_string()],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_all_files(&self) -> Result<Vec<String>> {
+        let guard = self.conn.lock().unwrap();
+        let mut paths = Vec::new();
+        {
+            let mut stmt = guard.prepare("SELECT path FROM frames")?;
+            paths.extend(
+                stmt.query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+        }
+        {
+            let mut stmt = guard.prepare("SELECT path FROM videos")?;
+            paths.extend(
+                stmt.query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
         }
         Ok(paths)
+    }
+
+    pub fn delete_all(&self) -> Result<()> {
+        let guard = self.conn.lock().unwrap();
+        guard.execute_batch(
+            "DELETE FROM embeddings;
+             DELETE FROM ocr_text;
+             DELETE FROM frames;
+             DELETE FROM videos;
+             DELETE FROM meta WHERE key IN ('archive_last_success_ts');",
+        )?;
+        Ok(())
+    }
+
+    pub fn wal_checkpoint_passive(&self) -> Result<()> {
+        let guard = self.conn.lock().unwrap();
+        guard.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")?;
+        Ok(())
     }
 
     /// Count of frames that have been archived to video.
@@ -599,7 +767,6 @@ impl Store {
         )?;
         Ok(n)
     }
-
     /// Count of frames that have NOT been archived to video.
     pub fn unarchived_frame_count(&self) -> Result<i64> {
         let guard = self.conn.lock().unwrap();
@@ -617,7 +784,10 @@ impl Store {
     pub fn pending_deletion_frame_count(&self, before_archived_at_ms: i64) -> Result<i64> {
         let guard = self.conn.lock().unwrap();
         let n: i64 = guard.query_row(
-            "SELECT COUNT(*) FROM frames WHERE archived_at IS NOT NULL AND archived_at >= ?1",
+            "SELECT COUNT(*) FROM frames
+             WHERE archived_at IS NOT NULL
+               AND archived_at >= ?1
+               AND source_deleted_at IS NULL",
             params![before_archived_at_ms],
             |r| r.get(0),
         )?;
@@ -629,11 +799,16 @@ impl Store {
     pub fn pending_deletion_disk_bytes(&self, before_archived_at_ms: i64) -> Result<u64> {
         let guard = self.conn.lock().unwrap();
         let mut stmt = guard.prepare(
-            "SELECT path FROM frames WHERE archived_at IS NOT NULL AND archived_at >= ?1",
+            "SELECT path FROM frames
+             WHERE archived_at IS NOT NULL
+               AND archived_at >= ?1
+               AND source_deleted_at IS NULL",
         )?;
         let paths: Vec<String> = stmt
             .query_map(params![before_archived_at_ms], |row| row.get(0))?
             .collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+        drop(guard);
         Ok(crate::util::disk::sum_file_sizes(&paths))
     }
 
@@ -651,13 +826,14 @@ impl Store {
 
     /// Total size on disk of individual frame files (excludes archived video files).
     pub fn unarchived_frame_disk_bytes(&self) -> Result<u64> {
-        let guard = self.conn.lock().unwrap();
-        let mut stmt = guard.prepare(
-            "SELECT path FROM frames WHERE video_path IS NULL",
-        )?;
-        let paths: Vec<String> = stmt
-            .query_map([], |row| row.get(0))?
-            .collect::<Result<Vec<_>, _>>()?;
+        let paths: Vec<String> = {
+            let guard = self.conn.lock().unwrap();
+            let mut stmt = guard.prepare(
+                "SELECT path FROM frames WHERE video_path IS NULL AND source_deleted_at IS NULL",
+            )?;
+            let rows = stmt.query_map([], |row| row.get(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
         Ok(crate::util::disk::sum_file_sizes(&paths))
     }
 
@@ -676,7 +852,11 @@ impl Store {
     /// List distinct monitor IDs that have fully-indexed unarchived frames in [min_ts, cutoff_ms].
     /// Only returns frames where OCR and embedding are complete, so the archiver never archives
     /// ahead of the indexer pipeline.
-    pub fn list_monitors_with_unarchived_range(&self, min_ts: i64, cutoff_ms: i64) -> Result<Vec<i32>> {
+    pub fn list_monitors_with_unarchived_range(
+        &self,
+        min_ts: i64,
+        cutoff_ms: i64,
+    ) -> Result<Vec<i32>> {
         let guard = self.conn.lock().unwrap();
         let mut stmt = guard.prepare(
             "SELECT DISTINCT monitor_id FROM frames WHERE video_path IS NULL AND ocr_done = 1 AND embed_done = 1 AND ts >= ?1 AND ts < ?2 ORDER BY monitor_id",
@@ -724,14 +904,6 @@ impl Store {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
-
-    pub fn delete_all(&self) -> Result<()> {
-        let guard = self.conn.lock().unwrap();
-        guard.execute_batch(
-            "DELETE FROM embeddings; DELETE FROM ocr_text; DELETE FROM frames;",
-        )?;
-        Ok(())
-    }
 }
 
 fn row_to_frame(row: &rusqlite::Row<'_>) -> rusqlite::Result<Frame> {
@@ -742,13 +914,15 @@ fn row_to_frame(row: &rusqlite::Row<'_>) -> rusqlite::Result<Frame> {
         app: row.get(3)?,
         window_title: row.get(4)?,
         monitor_id: row.get(5)?,
-        ocr_done: row.get::<_, i32>(6)? != 0,
-        embed_done: row.get::<_, i32>(7)? != 0,
-        static_until_ms: row.get(8)?,
-        has_embedding: row.get::<_, i32>(9)? != 0,
-        video_path: row.get(10)?,
-        video_offset_ms: row.get(11)?,
-        archived_at: row.get(12)?,
+        monitor_name: row.get(6)?,
+        ocr_done: row.get::<_, i32>(7)? != 0,
+        embed_done: row.get::<_, i32>(8)? != 0,
+        static_until_ms: row.get(9)?,
+        has_embedding: row.get::<_, i32>(10)? != 0,
+        video_path: row.get(11)?,
+        video_offset_ms: row.get(12)?,
+        archived_at: row.get(13)?,
+        source_deleted_at: row.get(14)?,
     })
 }
 
@@ -779,6 +953,19 @@ fn migrate_frames_static_until(conn: &Connection) -> Result<()> {
             [],
         )
         .context("backfill static_until_ms")?;
+    }
+    Ok(())
+}
+
+fn migrate_frames_monitor_name(conn: &Connection) -> Result<()> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('frames') WHERE name = 'monitor_name'",
+        [],
+        |r| r.get(0),
+    )?;
+    if n == 0 {
+        conn.execute("ALTER TABLE frames ADD COLUMN monitor_name TEXT", [])
+            .context("add monitor_name to frames")?;
     }
     Ok(())
 }
@@ -814,6 +1001,22 @@ fn migrate_archived_at(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_source_deleted_at(conn: &Connection) -> Result<()> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('frames') WHERE name = 'source_deleted_at'",
+        [],
+        |r| r.get(0),
+    )?;
+    if n == 0 {
+        conn.execute(
+            "ALTER TABLE frames ADD COLUMN source_deleted_at INTEGER",
+            [],
+        )
+        .context("add source_deleted_at to frames")?;
+    }
+    Ok(())
+}
+
 fn migrate_unarchived_index(conn: &Connection) -> Result<()> {
     // Partial index covering the archiver's hot path: frames ready to archive.
     conn.execute(
@@ -825,6 +1028,276 @@ fn migrate_unarchived_index(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_videos_table(conn: &Connection) -> Result<()> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'videos'",
+        [],
+        |r| r.get(0),
+    )?;
+    if n == 0 {
+        conn.execute_batch(
+            "CREATE TABLE videos (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                path         TEXT NOT NULL UNIQUE,
+                start_ts     INTEGER NOT NULL,
+                end_ts       INTEGER NOT NULL,
+                monitor_id   INTEGER NOT NULL,
+                monitor_name TEXT,
+                frame_count  INTEGER NOT NULL,
+                created_at   INTEGER NOT NULL
+            );
+            CREATE INDEX idx_videos_created_at ON videos(created_at);",
+        )
+        .context("create videos table")?;
+    }
+    Ok(())
+}
+
+fn backfill_videos(conn: &Connection) -> Result<()> {
+    let n: i64 = conn.query_row("SELECT COUNT(*) FROM videos", [], |r| r.get(0))?;
+    if n > 0 {
+        return Ok(());
+    }
+    let mut stmt = conn.prepare(
+        "SELECT f.video_path,
+                MIN(f.ts),
+                MAX(f.ts),
+                f.monitor_id,
+                (SELECT ff.monitor_name FROM frames ff WHERE ff.monitor_id = f.monitor_id AND ff.monitor_name IS NOT NULL LIMIT 1),
+                COUNT(*)
+         FROM frames f
+         WHERE f.video_path IS NOT NULL
+         GROUP BY f.video_path",
+    )?;
+    let mut insert = conn.prepare(
+        "INSERT OR IGNORE INTO videos(path, start_ts, end_ts, monitor_id, monitor_name, frame_count, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, i32>(3)?,
+            row.get::<_, Option<String>>(4)?,
+            row.get::<_, i64>(5)?,
+        ))
+    })?;
+    for row in rows {
+        let (path, start_ts, end_ts, monitor_id, monitor_name, frame_count) = row?;
+        insert.execute(params![
+            path,
+            start_ts,
+            end_ts,
+            monitor_id,
+            monitor_name,
+            frame_count,
+            start_ts
+        ])?;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct Video {
+    pub id: i64,
+    pub path: String,
+    pub start_ts: i64,
+    pub end_ts: i64,
+    pub monitor_id: i32,
+    pub monitor_name: Option<String>,
+    pub frame_count: i64,
+    pub created_at: i64,
+}
+
+impl Store {
+    pub fn get_monitor_name(&self, monitor_id: i32) -> Result<Option<String>> {
+        let guard = self.conn.lock().unwrap();
+        Ok(guard.query_row(
+            "SELECT monitor_name FROM frames WHERE monitor_id = ?1 AND monitor_name IS NOT NULL LIMIT 1",
+            params![monitor_id],
+            |r| r.get(0),
+        ).optional()?)
+    }
+
+    pub fn insert_video(
+        &self,
+        path: &str,
+        start_ts: i64,
+        end_ts: i64,
+        monitor_id: i32,
+        monitor_name: Option<&str>,
+        frame_count: i64,
+    ) -> Result<i64> {
+        let guard = self.conn.lock().unwrap();
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        guard.execute(
+            "INSERT INTO videos(path, start_ts, end_ts, monitor_id, monitor_name, frame_count, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![path, start_ts, end_ts, monitor_id, monitor_name, frame_count, now_ms],
+        )?;
+        Ok(guard.last_insert_rowid())
+    }
+
+    pub fn list_videos(&self, limit: i64, before_ts: Option<i64>) -> Result<Vec<Video>> {
+        let guard = self.conn.lock().unwrap();
+        let mut stmt = guard.prepare(
+            "SELECT id, path, start_ts, end_ts, monitor_id, monitor_name, frame_count, created_at
+             FROM videos
+             WHERE (?1 IS NULL OR created_at < ?1)
+             ORDER BY created_at DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![before_ts, limit], |row| {
+                Ok(Video {
+                    id: row.get(0)?,
+                    path: row.get(1)?,
+                    start_ts: row.get(2)?,
+                    end_ts: row.get(3)?,
+                    monitor_id: row.get(4)?,
+                    monitor_name: row.get(5)?,
+                    frame_count: row.get(6)?,
+                    created_at: row.get(7)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+}
+
 fn norm(v: &[f32]) -> f32 {
     v.iter().map(|x| x * x).sum::<f32>().sqrt()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    struct TestDir {
+        path: PathBuf,
+    }
+
+    impl TestDir {
+        fn new(name: &str) -> Self {
+            let path =
+                std::env::temp_dir().join(format!("screenrecall-{name}-{}", uuid::Uuid::new_v4()));
+            fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+
+        fn join(&self, path: impl AsRef<Path>) -> PathBuf {
+            self.path.join(path)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn open_test_store(name: &str) -> (TestDir, Store) {
+        let dir = TestDir::new(name);
+        let store = Store::open(&dir.join("screenrecall.db")).unwrap();
+        (dir, store)
+    }
+
+    #[test]
+    fn delete_expired_source_files_marks_deleted_but_preserves_frame_paths() {
+        let (dir, store) = open_test_store("delete-expired");
+        let existing = dir.join("existing.jpg");
+        let missing = dir.join("missing.jpg");
+        fs::write(&existing, b"frame").unwrap();
+
+        let existing_id = store
+            .insert_frame(
+                1_000,
+                &existing.to_string_lossy(),
+                1,
+                None,
+                None,
+                7,
+                Some("Panel"),
+            )
+            .unwrap();
+        let missing_id = store
+            .insert_frame(
+                1_100,
+                &missing.to_string_lossy(),
+                2,
+                None,
+                None,
+                7,
+                Some("Panel"),
+            )
+            .unwrap();
+        store
+            .set_video_archive(
+                &dir.join("archive.mp4").to_string_lossy(),
+                &[(existing_id, 0), (missing_id, 1_000)],
+                2_000,
+            )
+            .unwrap();
+
+        let deleted = store.delete_expired_source_files(3_000).unwrap();
+
+        assert_eq!(deleted, vec![existing.to_string_lossy().to_string()]);
+        assert!(!existing.exists());
+        let existing_frame = store.get_frame(existing_id).unwrap().unwrap();
+        let missing_frame = store.get_frame(missing_id).unwrap().unwrap();
+        assert_eq!(existing_frame.path, existing.to_string_lossy());
+        assert_eq!(missing_frame.path, missing.to_string_lossy());
+        assert!(existing_frame.source_deleted_at.is_some());
+        assert!(missing_frame.source_deleted_at.is_some());
+    }
+
+    #[test]
+    fn delete_all_clears_frames_videos_and_archive_cursor() {
+        let (dir, store) = open_test_store("delete-all");
+        let frame_path = dir.join("frame.jpg");
+        let video_path = dir.join("video.mp4");
+        fs::write(&frame_path, b"frame").unwrap();
+        fs::write(&video_path, b"video").unwrap();
+
+        let frame_id = store
+            .insert_frame(
+                1_000,
+                &frame_path.to_string_lossy(),
+                1,
+                None,
+                None,
+                1,
+                Some("Panel"),
+            )
+            .unwrap();
+        store
+            .set_video_archive(&video_path.to_string_lossy(), &[(frame_id, 0)], 2_000)
+            .unwrap();
+        store
+            .insert_video(
+                &video_path.to_string_lossy(),
+                1_000,
+                2_000,
+                1,
+                Some("Panel"),
+                1,
+            )
+            .unwrap();
+        store
+            .set_meta_i64("archive_last_success_ts", 2_000)
+            .unwrap();
+
+        let files = store.delete_all_files().unwrap();
+        assert!(files.contains(&frame_path.to_string_lossy().to_string()));
+        assert!(files.contains(&video_path.to_string_lossy().to_string()));
+
+        store.delete_all().unwrap();
+
+        assert_eq!(store.stats().unwrap(), (0, 0));
+        assert!(store.list_videos(10, None).unwrap().is_empty());
+        assert_eq!(store.get_meta_i64("archive_last_success_ts").unwrap(), None);
+    }
 }

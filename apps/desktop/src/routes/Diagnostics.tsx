@@ -3,6 +3,7 @@ import { getVersion } from "@tauri-apps/api/app";
 import { api } from "../lib/api";
 import { formatBytes } from "../lib/format";
 import type {
+  AdaptiveMonitorDiagnostic,
   AppConfig,
   ArchiverStatus,
   CapturePerfSnapshot,
@@ -92,8 +93,10 @@ function PerPhaseCard({ title, stats }: { title: string; stats: PerPhaseStats })
     <div className="space-y-1.5 rounded border border-border/60 bg-bg p-3">
       <div className="text-[11px] font-medium text-text">{title}</div>
       <PhaseTimingRow label="Capture" t={stats.capture} />
+      <PhaseTimingRow label="dHash" t={stats.dhash} />
       <PhaseTimingRow label="Downscale" t={stats.downscale} />
       <PhaseTimingRow label="Save" t={stats.save} />
+      <PhaseTimingRow label="DB" t={stats.db} />
       <PhaseTimingRow label="Total" t={stats.total} />
     </div>
   );
@@ -156,6 +159,7 @@ export default function Diagnostics() {
   const [archiver, setArchiver] = useState<ArchiverStatus | null>(null);
   const [capturePerf, setCapturePerf] = useState<CapturePerfSnapshot | null>(null);
   const [showAllCapturePerf, setShowAllCapturePerf] = useState(false);
+  const [adaptiveState, setAdaptiveState] = useState<AdaptiveMonitorDiagnostic[]>([]);
 
   const refresh = async () => {
     setLoading(true);
@@ -171,16 +175,18 @@ export default function Diagnostics() {
           api.getHealthSnapshot().catch(() => null),
           api.getArchiverStatus().catch(() => null),
         ]);
-      const [cfg, status, st, cp] = await Promise.all([
+      const [cfg, status, st, cp, ad] = await Promise.all([
         api.getConfig(),
         api.getStatus(),
         api.getStats().catch(() => null),
         api.getCapturePerf().catch(() => null),
+        api.getAdaptiveState().catch(() => []),
       ]);
       setConfig(cfg);
       setRecording(status.recording);
       if (st) setStats(st);
       if (cp) setCapturePerf(cp);
+      setAdaptiveState(ad);
       setPerfPath(path);
       setProcessPath(procPath);
       setPerfRaw(perf.join("\n"));
@@ -508,6 +514,50 @@ export default function Diagnostics() {
               <span>Last tick: {formatMsStat(capturePerf.lastTickMs)}</span>
               <span>Enumeration: {formatMsStat(capturePerf.lastTickEnumMs)}</span>
             </div>
+          </section>
+        )}
+
+        {config?.capture_adaptive_dedupe_enabled && (
+          <section className="col-span-1 space-y-2 rounded-md border border-border bg-bg-elevated p-4 xl:col-span-2">
+            <div>
+              <h2 className="text-xs font-semibold text-text">Adaptive dedupe</h2>
+              <p className="mt-0.5 text-[11px] text-text-faint">
+                Per-monitor noisy-feed detection state. A monitor is flagged noisy when it saves
+                frames on ≥15 of the last 20 ticks with every distance &lt; 13.
+              </p>
+            </div>
+            {adaptiveState.length === 0 ? (
+              <p className="text-[11px] text-text-faint">No monitors tracked yet.</p>
+            ) : (
+              <div className="grid gap-3 text-[11px] sm:grid-cols-2">
+                {adaptiveState.map((m) => (
+                  <div
+                    key={m.monitorId}
+                    className="space-y-1 rounded border border-border/60 bg-bg p-3"
+                  >
+                    <div className="font-medium text-text">
+                      Monitor {m.monitorId}
+                      {m.isNoisy ? (
+                        <span className="ml-2 text-amber-400">● noisy</span>
+                      ) : (
+                        <span className="ml-2 text-green-400">● normal</span>
+                      )}
+                    </div>
+                    <div className="text-text-muted">
+                      Ticks: {m.tickCount} saved · {m.savedTickCount} total
+                    </div>
+                    <div className="text-text-muted">
+                      Last distance: {m.lastDistance}
+                    </div>
+                    {m.mergedFramesCount > 0 && (
+                      <div className="text-text-muted">
+                        Retroactive merges: {m.mergedFramesCount.toLocaleString()} frames
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
           </section>
         )}
 

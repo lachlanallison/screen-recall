@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { format } from "date-fns";
 import { Copy, Expand, ExternalLink, FolderOpen, Film, Image as ImageIcon } from "lucide-react";
-import { api, type EmbeddingPreview, type Frame } from "../lib/api";
+import { api, type EmbeddingPreview, type Frame, type Video } from "../lib/api";
 import { FrameViewer } from "../lib/components/ImageViewer";
 import { ContextMenu } from "../lib/components/ContextMenu";
 import { useEscape } from "../lib/components/useEscape";
@@ -16,23 +16,36 @@ type TimelineItem =
   | { type: "still"; frame: Frame };
 
 function buildTimelineItems(frames: Frame[]): TimelineItem[] {
-  const items: TimelineItem[] = [];
-  let i = 0;
-  while (i < frames.length) {
-    const f = frames[i];
+  const videoGroups = new Map<string, Frame[]>();
+  const stills: Frame[] = [];
+
+  for (const f of frames) {
     if (f.video_path) {
-      // Collect all consecutive frames with the same video_path.
-      const group: Frame[] = [f];
-      while (i + 1 < frames.length && frames[i + 1].video_path === f.video_path) {
-        i++;
-        group.push(frames[i]);
+      const group = videoGroups.get(f.video_path);
+      if (group) {
+        group.push(f);
+      } else {
+        videoGroups.set(f.video_path, [f]);
       }
-      items.push({ type: "video", videoPath: f.video_path, frames: group });
     } else {
-      items.push({ type: "still", frame: f });
+      stills.push(f);
     }
-    i++;
   }
+
+  const items: TimelineItem[] = [];
+  for (const [videoPath, groupFrames] of videoGroups) {
+    groupFrames.sort((a, b) => a.ts - b.ts);
+    items.push({ type: "video", videoPath, frames: groupFrames });
+  }
+  for (const f of stills) {
+    items.push({ type: "still", frame: f });
+  }
+
+  items.sort((a, b) => {
+    const aTs = a.type === "video" ? a.frames[a.frames.length - 1].ts : a.frame.ts;
+    const bTs = b.type === "video" ? b.frames[b.frames.length - 1].ts : b.frame.ts;
+    return bTs - aTs;
+  });
   return items;
 }
 
@@ -58,19 +71,37 @@ export default function Timeline() {
     "any" | "vector" | "na" | "pending"
   >("any");
   const [viewMode, setViewMode] = useState<"latest" | "archived">("latest");
+  const [monitorFilter, setMonitorFilter] = useState<string>("all");
 
   // State for video frame extraction
   const [frozenFrameUrl, setFrozenFrameUrl] = useState<string | null>(null);
   const [activeFrame, setActiveFrame] = useState<Frame | null>(null);
 
+  const [videos, setVideos] = useState<Video[]>([]);
+  const [loadingVideos, setLoadingVideos] = useState(false);
+  const [loadingMoreVideos, setLoadingMoreVideos] = useState(false);
+  const [hasMoreVideos, setHasMoreVideos] = useState(true);
+
   const refreshFrames = useCallback(async () => {
     try {
       const result = await api.listFrames({ limit: PAGE_SIZE });
       setFrames((prev) => {
+        const idToResult = new Map(result.map((f) => [f.id, f]));
         const seen = new Set(prev.map((f) => f.id));
         const add = result.filter((f) => !seen.has(f.id));
-        if (add.length === 0) return prev;
-        return [...add, ...prev];
+
+        if (add.length === 0 && idToResult.size === 0) return prev;
+
+        // Update static_until_ms for existing frames that appear in the refresh result
+        const updated = prev.map((f) => {
+          const refreshed = idToResult.get(f.id);
+          if (refreshed && refreshed.static_until_ms !== f.static_until_ms) {
+            return { ...f, static_until_ms: refreshed.static_until_ms };
+          }
+          return f;
+        });
+
+        return [...add, ...updated];
       });
     } catch {
       /* ignore */
@@ -79,16 +110,75 @@ export default function Timeline() {
     }
   }, []);
 
+  const refreshVideos = useCallback(async () => {
+    try {
+      const result = await api.listVideos({ limit: PAGE_SIZE });
+      setVideos(result);
+      setHasMoreVideos(result.length >= PAGE_SIZE);
+    } catch {
+      /* ignore */
+    } finally {
+      setLoadingVideos(false);
+    }
+  }, []);
+
+  const loadOlderVideos = useCallback(async () => {
+    if (loadingMoreVideos || !hasMoreVideos || videos.length === 0) return;
+    const oldest = videos[videos.length - 1]?.created_at;
+    if (!oldest) return;
+    setLoadingMoreVideos(true);
+    try {
+      const older = await api.listVideos({ limit: PAGE_SIZE, beforeTs: oldest });
+      if (older.length === 0) {
+        setHasMoreVideos(false);
+        return;
+      }
+      setVideos((prev) => {
+        const seen = new Set(prev.map((v) => v.id));
+        const add = older.filter((v) => !seen.has(v.id));
+        return [...prev, ...add];
+      });
+      setHasMoreVideos(older.length >= PAGE_SIZE);
+    } catch {
+      // ignore
+    } finally {
+      setLoadingMoreVideos(false);
+    }
+  }, [videos, hasMoreVideos, loadingMoreVideos]);
+
+  const monitors = useMemo(
+    () => {
+      const seen = new Map<number, string>();
+      for (const f of frames) {
+        if (!seen.has(f.monitor_id)) {
+          seen.set(f.monitor_id, f.monitor_name ?? `Monitor ${f.monitor_id}`);
+        }
+      }
+      for (const v of videos) {
+        if (!seen.has(v.monitor_id)) {
+          seen.set(v.monitor_id, v.monitor_name ?? `Monitor ${v.monitor_id}`);
+        }
+      }
+      return [...seen.entries()].sort((a, b) => a[1].localeCompare(b[1]));
+    },
+    [frames, videos],
+  );
+
+  const filterByMonitor = (f: Frame): boolean =>
+    monitorFilter === "all" || String(f.monitor_id) === monitorFilter;
+
+  const filterVideoByMonitor = (v: Video): boolean =>
+    monitorFilter === "all" || String(v.monitor_id) === monitorFilter;
+
   // Separate filtered views derived from the same frames array — instant switching.
   const latestFrames = useMemo(
-    () => frames.filter((f) => matchDebugFilters(f, ocrFilter, embedFilter) && !f.video_path),
-    [frames, ocrFilter, embedFilter],
+    () => frames.filter((f) => matchDebugFilters(f, ocrFilter, embedFilter) && !f.video_path && filterByMonitor(f)),
+    [frames, ocrFilter, embedFilter, monitorFilter],
   );
-  const archivedFrames = useMemo(
-    () => frames.filter((f) => f.video_path),
-    [frames],
+  const filteredVideos = useMemo(
+    () => videos.filter(filterVideoByMonitor),
+    [videos, monitorFilter],
   );
-  const displayFrames = viewMode === "archived" ? archivedFrames : latestFrames;
 
   useEffect(() => {
     setSelected((prev) => {
@@ -143,6 +233,19 @@ export default function Timeline() {
     const id = window.setInterval(() => void refreshFrames(), refreshSecs * 1000);
     return () => clearInterval(id);
   }, [refreshSecs, refreshFrames]);
+
+  useEffect(() => {
+    if (viewMode === "archived") {
+      setLoadingVideos(true);
+      void refreshVideos();
+    }
+  }, [viewMode, refreshVideos]);
+
+  useEffect(() => {
+    if (refreshSecs === 0 || viewMode !== "archived") return;
+    const id = window.setInterval(() => void refreshVideos(), refreshSecs * 1000);
+    return () => clearInterval(id);
+  }, [refreshSecs, viewMode, refreshVideos]);
 
   const closeMenu = useCallback(() => setMenu(null), []);
   useEscape(() => { setViewer(null); setMenu(null); });
@@ -332,13 +435,16 @@ export default function Timeline() {
           )}
           {viewMode === "archived" && (
             <span className="ml-auto text-xs text-text-faint">
-              {archivedFrames.length} archived
+              {filteredVideos.length} videos
+              {videos.length !== filteredVideos.length ? ` of ${videos.length}` : ""}
               {refreshSecs > 0 ? ` · refresh ${refreshSecs}s` : ""}
             </span>
           )}
         </div>
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[10px] text-text-faint">
-          <span className="text-text-muted">Debug</span>
+          {viewMode === "latest" && (
+            <>
+              <span className="text-text-muted">Debug</span>
           <label className="inline-flex items-center gap-1">
             <span className="text-text-faint">OCR</span>
             <select
@@ -366,63 +472,114 @@ export default function Timeline() {
               <option value="pending">pending</option>
             </select>
           </label>
-          <button
-            type="button"
-            onClick={() => void loadOlder()}
-            disabled={!hasMore || loadingMore}
-            className="ml-auto rounded border border-border px-2 py-0.5 text-[10px] text-text-muted hover:bg-bg-hover disabled:opacity-50"
-          >
-            {loadingMore ? "Loading older…" : hasMore ? "Load older" : "No older frames"}
-          </button>
+            </>
+          )}
+          {monitors.length > 1 && (
+            <label className="inline-flex items-center gap-1">
+              <span className="text-text-faint">Monitor</span>
+              <select
+                value={monitorFilter}
+                onChange={(e) => setMonitorFilter(e.target.value)}
+                className="max-w-[10rem] rounded border border-border bg-bg px-1 py-0.5 text-[10px] text-text"
+              >
+                <option value="all">all</option>
+                {monitors.map(([id, name]) => (
+                  <option key={id} value={String(id)}>{name}</option>
+                ))}
+              </select>
+            </label>
+          )}
+          {viewMode === "latest" ? (
+            <button
+              type="button"
+              onClick={() => void loadOlder()}
+              disabled={!hasMore || loadingMore}
+              className="ml-auto rounded border border-border px-2 py-0.5 text-[10px] text-text-muted hover:bg-bg-hover disabled:opacity-50"
+            >
+              {loadingMore ? "Loading older…" : hasMore ? "Load older" : "No older frames"}
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={() => void loadOlderVideos()}
+              disabled={!hasMoreVideos || loadingMoreVideos}
+              className="ml-auto rounded border border-border px-2 py-0.5 text-[10px] text-text-muted hover:bg-bg-hover disabled:opacity-50"
+            >
+              {loadingMoreVideos ? "Loading older…" : hasMoreVideos ? "Load older" : "No older videos"}
+            </button>
+          )}
         </div>
       </header>
 
-      {loading ? (
+      {loading || (viewMode === "archived" && loadingVideos) ? (
         <Empty message="Loading..." />
+      ) : viewMode === "archived" ? (
+        filteredVideos.length === 0 ? (
+          <Empty message={videos.length === 0 ? "No archived videos yet. They appear after the archiver runs." : "No videos match the monitor filter."} />
+        ) : (
+          <div className="flex-1 overflow-y-auto scrollbar-thin p-4 space-y-6">
+            {Object.entries(groupVideosByDay(filteredVideos)).map(([day, dayVideos]) => (
+              <section key={day} className="space-y-2">
+                <h2 className="text-xs font-semibold uppercase tracking-wider text-text-muted">
+                  {day} · {dayVideos.length} video{dayVideos.length !== 1 ? "s" : ""}
+                </h2>
+                <div className="grid grid-cols-[repeat(auto-fill,minmax(260px,1fr))] gap-3">
+                  {dayVideos.map((v) => (
+                    <ArchivedVideoCard
+                      key={v.id}
+                      video={v}
+                      onClick={() => {
+                        const frame: Frame = {
+                          id: 0,
+                          ts: v.start_ts,
+                          path: v.path,
+                          app: null,
+                          window_title: null,
+                          monitor_id: v.monitor_id,
+                          monitor_name: v.monitor_name,
+                          ocr_done: true,
+                          embed_done: true,
+                          has_embedding: false,
+                          static_until_ms: v.end_ts,
+                          video_path: v.path,
+                          video_offset_ms: 0,
+                          archived_at: null,
+                          source_deleted_at: null,
+                        };
+                        setViewer(frame);
+                      }}
+                      onContextMenu={(e) => {
+                        e.preventDefault();
+                        const frame: Frame = {
+                          id: 0,
+                          ts: v.start_ts,
+                          path: v.path,
+                          app: null,
+                          window_title: null,
+                          monitor_id: v.monitor_id,
+                          monitor_name: v.monitor_name,
+                          ocr_done: true,
+                          embed_done: true,
+                          has_embedding: false,
+                          static_until_ms: v.end_ts,
+                          video_path: v.path,
+                          video_offset_ms: 0,
+                          archived_at: null,
+                          source_deleted_at: null,
+                        };
+                        setMenu({ x: e.clientX, y: e.clientY, frame });
+                      }}
+                    />
+                  ))}
+                </div>
+              </section>
+            ))}
+          </div>
+        )
       ) : frames.length === 0 ? (
         <Empty message="Nothing captured yet. ScreenRecall will start indexing in the background." />
-      ) : displayFrames.length === 0 ? (
-        <Empty message={viewMode === "archived" ? "No archived videos yet. They appear after the archiver runs." : "No frames match the debug filters."} />
-      ) : viewMode === "archived" ? (
-        <div className="flex-1 overflow-y-auto scrollbar-thin p-4 space-y-6">
-          {Object.entries(groupByDay(archivedFrames)).map(([day, dayFrames]) => {
-            const dayItems = buildTimelineItems(dayFrames);
-            const segmentCards = dayItems.filter((i) => i.type === "video");
-            if (segmentCards.length === 0) return null;
-            return (
-            <section key={day} className="space-y-2">
-              <h2 className="text-xs font-semibold uppercase tracking-wider text-text-muted">{day}</h2>
-              <div className="grid grid-cols-[repeat(auto-fill,minmax(260px,1fr))] gap-3">
-                {segmentCards.map((item) => (
-                  <button
-                    key={item.videoPath}
-                    type="button"
-                    onClick={() => setViewer(item.frames[0])}
-                    onContextMenu={(e) => {
-                      e.preventDefault();
-                      setMenu({ x: e.clientX, y: e.clientY, frame: item.frames[0] });
-                    }}
-                    className={"group overflow-hidden rounded-lg border bg-bg-elevated text-left transition-all text-text-muted hover:border-border-strong" + (selected?.id === item.frames[0]?.id ? " border-accent ring-1 ring-accent" : " border-border")}
-                  >
-                    <div className="aspect-video bg-black/40 overflow-hidden">
-                      <video src={api.assetUrl(item.videoPath)} className="h-full w-full object-cover" preload="metadata" muted />
-                    </div>
-                    <div className="p-3">
-                      <div className="flex items-center gap-1.5 text-xs">
-                        <Film className="h-3 w-3 text-blue-400 shrink-0" />
-                        <span className="truncate">{item.frames[0]?.window_title ?? item.frames[0]?.app ?? "—"}</span>
-                      </div>
-                      <div className="mt-1 text-[10px] text-text-faint">
-                        {item.frames.length} frames · {Math.round(((item.frames[item.frames.length - 1]?.ts ?? 0) - (item.frames[0]?.ts ?? 0)) / 1000)}s
-                      </div>
-                    </div>
-                  </button>
-                ))}
-              </div>
-            </section>
-            );
-          })}
-        </div>
+      ) : latestFrames.length === 0 ? (
+        <Empty message="No frames match the debug filters." />
       ) : (
         <div className="flex flex-1 overflow-hidden">
           <div className="flex-1 overflow-y-auto scrollbar-thin p-4 space-y-6">
@@ -482,12 +639,13 @@ export default function Timeline() {
                         <div className="text-[10px] text-text-faint">
                           #{f.id} ·{" "}
                           {format(f.ts, "HH:mm:ss")}
+                          {f.monitor_name && <> · {f.monitor_name}</>}
                           {held && (
                             <span className="ml-1 text-text-muted">· {held}</span>
                           )}
-                        </div>
-                      </div>
-                    </button>
+        </div>
+      </div>
+    </button>
                     );
                   })}
                 </div>
@@ -525,7 +683,7 @@ export default function Timeline() {
                         preload="metadata"
                         onLoadedMetadata={(e) => {
                           const video = e.currentTarget;
-                          if (displayFrame.video_offset_ms) {
+                          if (displayFrame.video_offset_ms != null) {
                             video.currentTime = displayFrame.video_offset_ms / 1000;
                           }
                         }}
@@ -741,7 +899,7 @@ export default function Timeline() {
             {
               label: "Open file location",
               icon: <FolderOpen className="h-3.5 w-3.5" />,
-              onClick: () => void api.revealFrameInFolder(menu.frame.path).catch(() => {}),
+              onClick: () => void api.revealFrameInFolder(menu.frame.video_path ?? menu.frame.path).catch(() => {}),
             },
           ]}
         />
@@ -761,10 +919,10 @@ function VideoSegmentCard({
   onSelect: (f: Frame) => void;
   onContextMenu: (e: React.MouseEvent, f: Frame) => void;
 }) {
-  const newest = item.frames[0];
-  const earliest = item.frames[item.frames.length - 1];
+  const first = item.frames[0];
+  const last = item.frames[item.frames.length - 1];
   const isSelected = item.frames.some((f) => f.id === selected?.id);
-  const durationSec = Math.round((newest.ts - earliest.ts) / 1000);
+  const durationSec = Math.round((last.ts - first.ts) / 1000);
   return (
     <div
       className={
@@ -780,27 +938,28 @@ function VideoSegmentCard({
           muted
           onLoadedMetadata={(e) => {
             const video = e.currentTarget;
-            if (earliest.video_offset_ms) {
-              video.currentTime = earliest.video_offset_ms / 1000;
+            if (first.video_offset_ms != null) {
+              video.currentTime = first.video_offset_ms / 1000;
             }
           }}
-          onClick={() => onSelect(earliest)}
-          onContextMenu={(e) => onContextMenu(e, earliest)}
+          onClick={() => onSelect(first)}
+          onContextMenu={(e) => onContextMenu(e, first)}
         />
       </div>
       <div className="px-3 py-2">
         <div className="flex items-center gap-1.5">
           <Film className="h-3 w-3 text-blue-400" />
           <span className="truncate text-xs text-text">
-            {earliest.window_title ?? earliest.app ?? "—"}
+            {first.window_title ?? first.app ?? "—"}
           </span>
         </div>
         <div className="text-[10px] text-text-faint">
-          {format(earliest.ts, "HH:mm:ss")} – {format(newest.ts, "HH:mm:ss")}
-          {" · "}
-          {item.frames.length} frames
+          {format(first.ts, "HH:mm:ss")} – {format(last.ts, "HH:mm:ss")}
           {" · "}
           {durationSec}s
+          {" · "}
+          {item.frames.length} captures
+          {first.monitor_name && <> · {first.monitor_name}</>}
         </div>
       </div>
     </div>
@@ -871,6 +1030,45 @@ function groupByDay(frames: Frame[]): Record<string, Frame[]> {
     (out[key] ??= []).push(f);
   }
   return out;
+}
+
+function groupVideosByDay(videos: Video[]): Record<string, Video[]> {
+  const out: Record<string, Video[]> = {};
+  for (const v of videos) {
+    const key = format(v.created_at, "EEEE, MMM d");
+    (out[key] ??= []).push(v);
+  }
+  return out;
+}
+
+function ArchivedVideoCard({ video, onClick, onContextMenu }: { video: Video; onClick: () => void; onContextMenu: (e: React.MouseEvent) => void }) {
+  const durationSec = Math.round((video.end_ts - video.start_ts) / 1000);
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      onContextMenu={onContextMenu}
+      className="group overflow-hidden rounded-lg border border-border bg-bg-elevated text-left"
+    >
+      <div className="aspect-video bg-black/40 overflow-hidden">
+        <video src={api.assetUrl(video.path)} className="h-full w-full object-cover" preload="metadata" muted />
+      </div>
+      <div className="p-3 space-y-1">
+        <div className="flex items-center gap-1.5 text-xs">
+          <Film className="h-3 w-3 text-blue-400 shrink-0" />
+          <span className="truncate text-text-muted">{video.path.split(/[/\\]/).pop()}</span>
+        </div>
+        <div className="text-[10px] text-text-faint">
+          {format(video.start_ts, "HH:mm:ss")} – {format(video.end_ts, "HH:mm:ss")}
+          {" · "}
+          {durationSec}s
+          {" · "}
+          {video.frame_count} captures
+          {video.monitor_name && <> · {video.monitor_name}</>}
+        </div>
+      </div>
+    </button>
+  );
 }
 
 function Empty({ message }: { message: string }) {

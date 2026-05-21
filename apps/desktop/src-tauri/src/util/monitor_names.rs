@@ -34,14 +34,16 @@ fn build_display_config_map() -> HashMap<String, String> {
     use windows::Win32::Devices::Display::{
         DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, QueryDisplayConfig,
         DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
-        DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_SOURCE_DEVICE_NAME,
-        DISPLAYCONFIG_TARGET_DEVICE_NAME, QDC_ONLY_ACTIVE_PATHS,
+        DISPLAYCONFIG_DEVICE_INFO_HEADER, DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO,
+        DISPLAYCONFIG_SOURCE_DEVICE_NAME, DISPLAYCONFIG_TARGET_DEVICE_NAME, QDC_ONLY_ACTIVE_PATHS,
     };
 
     let mut path_count = 0u32;
     let mut mode_count = 0u32;
 
-    let ok = unsafe { GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut path_count, &mut mode_count) };
+    let ok = unsafe {
+        GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut path_count, &mut mode_count)
+    };
     if ok.is_err() {
         return HashMap::new();
     }
@@ -66,11 +68,15 @@ fn build_display_config_map() -> HashMap<String, String> {
     let mut map = HashMap::new();
     for path in &paths[..path_count as usize] {
         // 1) Get the GDI source device name.
-        let mut source_name = DISPLAYCONFIG_SOURCE_DEVICE_NAME::default();
-        source_name.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
-        source_name.header.size = std::mem::size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>() as u32;
-        source_name.header.adapterId = path.sourceInfo.adapterId;
-        source_name.header.id = path.sourceInfo.id;
+        let mut source_name = DISPLAYCONFIG_SOURCE_DEVICE_NAME {
+            header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
+                r#type: DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
+                size: std::mem::size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>() as u32,
+                adapterId: path.sourceInfo.adapterId,
+                id: path.sourceInfo.id,
+            },
+            ..Default::default()
+        };
 
         let source_ok = unsafe { DisplayConfigGetDeviceInfo(&mut source_name.header) >= 0 };
         if !source_ok {
@@ -84,11 +90,15 @@ fn build_display_config_map() -> HashMap<String, String> {
         }
 
         // 2) Get the friendly monitor target name.
-        let mut target_name = DISPLAYCONFIG_TARGET_DEVICE_NAME::default();
-        target_name.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
-        target_name.header.size = std::mem::size_of::<DISPLAYCONFIG_TARGET_DEVICE_NAME>() as u32;
-        target_name.header.adapterId = path.targetInfo.adapterId;
-        target_name.header.id = path.targetInfo.id;
+        let mut target_name = DISPLAYCONFIG_TARGET_DEVICE_NAME {
+            header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
+                r#type: DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
+                size: std::mem::size_of::<DISPLAYCONFIG_TARGET_DEVICE_NAME>() as u32,
+                adapterId: path.targetInfo.adapterId,
+                id: path.targetInfo.id,
+            },
+            ..Default::default()
+        };
 
         let target_ok = unsafe { DisplayConfigGetDeviceInfo(&mut target_name.header) >= 0 };
         if !target_ok {
@@ -123,8 +133,10 @@ fn friendly_monitor_name_enum(gdi_name: &str) -> Option<String> {
     use windows::Win32::Graphics::Gdi::{EnumDisplayDevicesW, DISPLAY_DEVICEW};
 
     let wide: Vec<u16> = gdi_name.encode_utf16().chain(std::iter::once(0)).collect();
-    let mut device = DISPLAY_DEVICEW::default();
-    device.cb = std::mem::size_of::<DISPLAY_DEVICEW>() as u32;
+    let mut device = DISPLAY_DEVICEW {
+        cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32,
+        ..Default::default()
+    };
 
     let ok = unsafe { EnumDisplayDevicesW(PCWSTR(wide.as_ptr()), 0, &mut device, 0).as_bool() };
     if !ok {

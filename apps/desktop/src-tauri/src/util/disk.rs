@@ -35,8 +35,8 @@ pub fn volume_free_space(path: &Path) -> Option<(u64, u64)> {
     }
     #[cfg(not(target_os = "windows"))]
     {
-        use std::ffi::CString;
         use libc::{c_char, statfs};
+        use std::ffi::CString;
         let c_path = CString::new(path.as_os_str().as_encoded_bytes()).ok()?;
         let mut buf: libc::statfs = unsafe { std::mem::zeroed() };
         let rc = unsafe { statfs(c_path.as_ptr() as *const c_char, &mut buf) };

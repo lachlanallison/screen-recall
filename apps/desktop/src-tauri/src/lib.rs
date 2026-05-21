@@ -21,8 +21,8 @@ use util::workstation_lock;
 
 pub mod commands;
 
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tauri::{
@@ -55,10 +55,9 @@ pub fn run() {
             let handle = app.handle().clone();
 
             // Build state (loads config, opens DB, creates data dir).
-            let state = tauri::async_runtime::block_on(async {
-                AppState::new(handle.clone()).await
-            })
-            .expect("failed to initialize ScreenRecall state");
+            let state =
+                tauri::async_runtime::block_on(async { AppState::new(handle.clone()).await })
+                    .expect("failed to initialize ScreenRecall state");
             let state = Arc::new(state);
             app.manage(state.clone());
 
@@ -72,8 +71,8 @@ pub fn run() {
                             let p = frames_dir.clone();
                             move || dir_size_bytes(&p)
                         })
-                            .await
-                            .unwrap_or(0);
+                        .await
+                        .unwrap_or(0);
                         state.set_cached_disk_bytes(bytes);
                         if let Ok((frames, indexed)) = state.store.stats() {
                             state.set_cached_counts(frames, indexed);
@@ -87,6 +86,7 @@ pub fn run() {
                         if let Ok(unarchived_count) = state.store.unarchived_frame_count() {
                             state.set_cached_unarchived_count(unarchived_count);
                         }
+                        let _ = state.store.wal_checkpoint_passive();
                     }
 
                     // Run once immediately so stats aren't 0 on first paint.
@@ -179,8 +179,16 @@ pub fn run() {
                     let cwd = cfg.managed_server_working_dir.clone();
 
                     for (kind, command, autostart) in [
-                        ("chat", cfg.managed_chat_server_command.as_deref(), cfg.managed_chat_server_autostart),
-                        ("embed", cfg.managed_embed_server_command.as_deref(), cfg.managed_embed_server_autostart),
+                        (
+                            "chat",
+                            cfg.managed_chat_server_command.as_deref(),
+                            cfg.managed_chat_server_autostart,
+                        ),
+                        (
+                            "embed",
+                            cfg.managed_embed_server_command.as_deref(),
+                            cfg.managed_embed_server_autostart,
+                        ),
                     ] {
                         if !autostart {
                             continue;
@@ -198,7 +206,12 @@ pub fn run() {
                             &[cmd.to_string()],
                             cwd.as_deref(),
                         );
-                        match crate::state::shell_spawn(cmd, cwd.as_deref(), &stdout_path, &stderr_path) {
+                        match crate::state::shell_spawn(
+                            cmd,
+                            cwd.as_deref(),
+                            &stdout_path,
+                            &stderr_path,
+                        ) {
                             Ok(child) => {
                                 state.managed_llama.lock().await.insert(
                                     kind.to_string(),
@@ -220,9 +233,10 @@ pub fn run() {
             }
 
             // Ensure the main window gets the app icon in dev/prod so Windows taskbar uses it.
-            if let (Some(win), Some(icon)) =
-                (app.get_webview_window("main"), app.default_window_icon().cloned())
-            {
+            if let (Some(win), Some(icon)) = (
+                app.get_webview_window("main"),
+                app.default_window_icon().cloned(),
+            ) {
                 let _ = win.set_icon(icon);
             }
 
@@ -239,10 +253,7 @@ pub fn run() {
             let open_item =
                 MenuItem::with_id(app, "open", "Open ScreenRecall", true, None::<&str>)?;
             let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-            let menu = Menu::with_items(
-                app,
-                &[&open_item, &pause_item, &resume_item, &quit_item],
-            )?;
+            let menu = Menu::with_items(app, &[&open_item, &pause_item, &resume_item, &quit_item])?;
 
             let _tray = TrayIconBuilder::with_id("tray")
                 .icon(
@@ -370,6 +381,7 @@ pub fn run() {
             commands::archive_history_now,
             commands::transcode_archives,
             commands::list_frames,
+            commands::list_videos,
             commands::get_frame_ocr,
             commands::get_frame_embedding_preview,
             commands::requeue_ocr_rerun,
@@ -390,6 +402,7 @@ pub fn run() {
             commands::get_process_log_path,
             commands::get_launch_on_startup_status,
             commands::set_launch_on_startup,
+            commands::get_adaptive_state,
         ])
         .build(tauri::generate_context!())
         .expect("error while building ScreenRecall")

@@ -65,7 +65,7 @@ export function FrameViewer({
             <button
               type="button"
               onClick={() => {
-                void api.revealFrameInFolder(frame.path).catch(() => {});
+                void api.revealFrameInFolder(frame.video_path ?? frame.path).catch(() => {});
               }}
               className="rounded border border-border p-1 hover:bg-bg-hover"
               title="Open file location"
@@ -97,6 +97,11 @@ export function FrameViewer({
               className="h-full w-full object-contain"
               controls
               autoPlay
+              onLoadedMetadata={(e) => {
+                if (frame.video_offset_ms != null) {
+                  e.currentTarget.currentTime = frame.video_offset_ms / 1000;
+                }
+              }}
               onContextMenu={onContextMenu}
             />
           ) : (
@@ -110,5 +115,53 @@ export function FrameViewer({
         </div>
       </div>
     </div>
+  );
+}
+
+export function FrameThumbnail({
+  frame,
+  alt = "",
+  className = "h-full w-full object-cover",
+  loading = "lazy",
+  onContextMenu,
+}: {
+  frame: Frame;
+  alt?: string;
+  className?: string;
+  loading?: "eager" | "lazy";
+  onContextMenu?: (e: React.MouseEvent) => void;
+}) {
+  if (frame.video_path) {
+    return (
+      <div className={"relative overflow-hidden " + className}>
+        <video
+          src={api.assetUrl(frame.video_path)}
+          className="h-full w-full object-cover"
+          preload="metadata"
+          muted
+          playsInline
+          onLoadedMetadata={(e) => {
+            if (frame.video_offset_ms != null) {
+              e.currentTarget.currentTime = frame.video_offset_ms / 1000;
+            }
+          }}
+          onContextMenu={onContextMenu}
+        />
+        <span className="absolute right-1.5 top-1.5 rounded bg-black/70 p-1 text-blue-200">
+          <Film className="h-3 w-3" />
+        </span>
+      </div>
+    );
+  }
+
+  return (
+    <img
+      src={api.assetUrl(frame.path)}
+      alt={alt}
+      loading={loading}
+      decoding="async"
+      className={className}
+      onContextMenu={onContextMenu}
+    />
   );
 }

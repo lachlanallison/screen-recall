@@ -24,4 +24,3 @@ pub fn record(state: &SharedState, event: &str, fields: Value) {
     });
     let _ = writeln!(f, "{}", line);
 }
-

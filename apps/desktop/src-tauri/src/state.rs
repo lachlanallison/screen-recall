@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -7,8 +8,8 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use reqwest::Client;
 use tauri::AppHandle;
-use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc;
+use tokio::sync::Mutex as AsyncMutex;
 use tracing::info;
 
 use crate::capture_perf::CapturePerf;
@@ -68,6 +69,17 @@ pub struct AppState {
     disk_stopped: AtomicBool,
     /// Cached free-space percentage (0.0–100.0).
     disk_free_pct: RwLock<f64>,
+    /// Per-monitor adaptive dedupe state for diagnostics.
+    pub adaptive_diagnostics: std::sync::Arc<RwLock<HashMap<i32, AdaptiveMonitorInfo>>>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct AdaptiveMonitorInfo {
+    pub is_noisy: bool,
+    pub tick_count: usize,
+    pub saved_tick_count: usize,
+    pub last_distance: u32,
+    pub merged_frames_count: u64,
 }
 
 #[derive(Clone, Default)]
@@ -113,6 +125,7 @@ impl AppState {
             disk_warning: AtomicBool::new(false),
             disk_stopped: AtomicBool::new(false),
             disk_free_pct: RwLock::new(100.0),
+            adaptive_diagnostics: std::sync::Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -144,7 +157,10 @@ impl AppState {
     pub(crate) fn set_workstation_locked(&self, locked: bool) {
         let before = self.workstation_locked.swap(locked, Ordering::Relaxed);
         if before != locked {
-            info!(locked, "session lock state changed (skips capture when setting enabled)");
+            info!(
+                locked,
+                "session lock state changed (skips capture when setting enabled)"
+            );
         }
     }
 
@@ -170,7 +186,10 @@ impl AppState {
     }
 
     pub fn cached_counts(&self) -> (i64, i64) {
-        self.cache.read().map(|g| (g.frame_count, g.indexed_count)).unwrap_or((0, 0))
+        self.cache
+            .read()
+            .map(|g| (g.frame_count, g.indexed_count))
+            .unwrap_or((0, 0))
     }
 
     pub fn set_cached_unarchived_bytes(&self, bytes: u64) {
@@ -219,7 +238,7 @@ impl AppState {
         self.disk_warning.store(warning, Ordering::Relaxed);
         self.disk_stopped.store(stopped, Ordering::Relaxed);
         if let Ok(mut g) = self.disk_free_pct.write() {
-            *g = free_pct.max(0.0).min(100.0);
+            *g = free_pct.clamp(0.0, 100.0);
         }
     }
 
@@ -247,19 +266,28 @@ const MANAGED_LOG_MAX_BYTES: u64 = 10 * 1024 * 1024;
 /// Rotate a log file if it exceeds the size limit: keep the last N bytes.
 fn rotate_log_if_needed(path: &Path, max_bytes: u64) {
     use std::io::{Read, Seek, SeekFrom, Write};
-    if let Ok(mut f) = std::fs::OpenOptions::new().read(true).write(true).open(path) {
-        if let Ok(meta) = f.metadata() {
-            if meta.len() > max_bytes {
-                let keep_from = meta.len() - max_bytes;
-                let mut buf = vec![0u8; max_bytes as usize];
-                if f.seek(SeekFrom::Start(keep_from)).is_ok() && f.read_exact(&mut buf).is_ok() {
-                    if f.seek(SeekFrom::Start(0)).is_ok() {
-                        let _ = f.write_all(&buf);
-                        let _ = f.set_len(max_bytes);
-                    }
-                }
-            }
-        }
+    let Ok(mut f) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+    else {
+        return;
+    };
+    let Ok(meta) = f.metadata() else {
+        return;
+    };
+    if meta.len() <= max_bytes {
+        return;
+    }
+
+    let keep_from = meta.len() - max_bytes;
+    let mut buf = vec![0u8; max_bytes as usize];
+    if f.seek(SeekFrom::Start(keep_from)).is_ok()
+        && f.read_exact(&mut buf).is_ok()
+        && f.seek(SeekFrom::Start(0)).is_ok()
+    {
+        let _ = f.write_all(&buf);
+        let _ = f.set_len(max_bytes);
     }
 }
 
@@ -343,10 +371,8 @@ pub fn shell_spawn(
     if parts.len() > 1 {
         cmd.args(&parts[1..]);
     }
-    if let Some(wd) = cwd {
-        if !wd.trim().is_empty() {
-            cmd.current_dir(wd.trim());
-        }
+    if let Some(wd) = cwd.map(str::trim).filter(|wd| !wd.is_empty()) {
+        cmd.current_dir(wd);
     }
     if let Some(parent) = stdout_path.parent() {
         let _ = std::fs::create_dir_all(parent);

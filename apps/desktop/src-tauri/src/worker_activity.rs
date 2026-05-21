@@ -78,7 +78,9 @@ pub fn summarize_ms(samples: &[u64]) -> StageTimingStats {
     } else {
         (s[n / 2 - 1] + s[n / 2]) / 2
     };
-    let p95_i = ((n as f64 * 0.95).ceil() as usize).saturating_sub(1).min(n - 1);
+    let p95_i = ((n as f64 * 0.95).ceil() as usize)
+        .saturating_sub(1)
+        .min(n - 1);
     StageTimingStats {
         sample_count: n,
         min_ms: Some(s[0]),
